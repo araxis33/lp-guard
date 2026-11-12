@@ -8,20 +8,37 @@ import {ISystemContract} from "@reactive/src/interfaces/ISystemContract.sol";
 
 /// Stands in for Reactive's system contract at 0x8888…: records subscriptions and callback requests.
 contract MockSystem {
-    struct Sub { uint256 chainId; address c; uint256 topic0; }
+    struct Sub {
+        uint256 chainId;
+        address c;
+        uint256 topic0;
+    }
     Sub[] public subs;
     ISystemContract.CallbackConfiguration_V_1_0[] internal reqs;
 
     function subscribe(uint256 chainId, address c, uint256 topic0, uint256, uint256, uint256) external {
         subs.push(Sub(chainId, c, topic0));
     }
+
     function requestCallbackV_1_0(ISystemContract.CallbackConfiguration_V_1_0 memory cfg) external {
         reqs.push(cfg);
     }
-    function subCount() external view returns (uint256) { return subs.length; }
-    function reqCount() external view returns (uint256) { return reqs.length; }
-    function req(uint256 i) external view returns (ISystemContract.CallbackConfiguration_V_1_0 memory) { return reqs[i]; }
-    function debt(address) external pure returns (uint256) { return 0; }
+
+    function subCount() external view returns (uint256) {
+        return subs.length;
+    }
+
+    function reqCount() external view returns (uint256) {
+        return reqs.length;
+    }
+
+    function req(uint256 i) external view returns (ISystemContract.CallbackConfiguration_V_1_0 memory) {
+        return reqs[i];
+    }
+
+    function debt(address) external pure returns (uint256) {
+        return 0;
+    }
     receive() external payable {}
 }
 
@@ -33,7 +50,9 @@ contract GuardReactiveTest is Test {
     GuardReactive rx;
     MockSystem sys;
     uint256 clock = 1_000_000; // explicit clock: with via-IR, block.timestamp read in a test can be stale after vm.warp
-    uint256 WATCH; uint256 UNWATCH; uint256 SWAP; // cached: a getter call would use up vm.prank
+    uint256 WATCH; // cached: a getter call would use up vm.prank
+    uint256 UNWATCH;
+    uint256 SWAP;
 
     function setUp() public {
         vm.etch(SYSTEM, address(new MockSystem()).code);
@@ -44,14 +63,29 @@ contract GuardReactiveTest is Test {
         vm.warp(clock);
     }
 
-    function _skip(uint256 dt) internal { clock += dt; vm.warp(clock); }
-    function _log(address c, uint256 t0, uint256 t1, uint256 t2, bytes memory data) internal pure returns (IReactive.LogRecord memory l) {
-        l.chainId = BASE; l.contractAddress = c; l.topic0 = t0; l.topic1 = t1; l.topic2 = t2; l.data = data;
+    function _skip(uint256 dt) internal {
+        clock += dt;
+        vm.warp(clock);
     }
+
+    function _log(address c, uint256 t0, uint256 t1, uint256 t2, bytes memory data)
+        internal
+        pure
+        returns (IReactive.LogRecord memory l)
+    {
+        l.chainId = BASE;
+        l.contractAddress = c;
+        l.topic0 = t0;
+        l.topic1 = t1;
+        l.topic2 = t2;
+        l.data = data;
+    }
+
     function _watch(uint256 id, int24 lo, int24 hi, uint32 grace) internal {
         vm.prank(SYSTEM);
         rx.react(_log(guard, WATCH, id, uint256(uint160(pool)), abi.encode(lo, hi, grace)));
     }
+
     function _swap(int24 tick) internal {
         vm.prank(SYSTEM);
         rx.react(_log(pool, SWAP, 0, 0, abi.encode(int256(1), int256(-1), uint160(1), uint128(1), tick)));
@@ -70,13 +104,13 @@ contract GuardReactiveTest is Test {
 
     function test_closesOnlyAfterGraceOutOfRange() public {
         _watch(1, -100, 100, 3 hours);
-        _swap(0);                       // inside
-        _swap(150);                     // goes out: clock starts
+        _swap(0); // inside
+        _swap(150); // goes out: clock starts
         _skip(2 hours);
-        _swap(160);                     // still out, grace not over
+        _swap(160); // still out, grace not over
         assertEq(sys.reqCount(), 0);
         _skip(61 minutes);
-        _swap(170);                     // out for 3 h 1 min
+        _swap(170); // out for 3 h 1 min
         assertEq(sys.reqCount(), 1);
         ISystemContract.CallbackConfiguration_V_1_0 memory r = sys.req(0);
         assertEq(r.chainId, BASE);
@@ -91,9 +125,9 @@ contract GuardReactiveTest is Test {
         _watch(1, -100, 100, 3 hours);
         _swap(150);
         _skip(2 hours);
-        _swap(50);                      // back inside
+        _swap(50); // back inside
         _skip(2 hours);
-        _swap(150);                     // out again: a fresh clock
+        _swap(150); // out again: a fresh clock
         _skip(2 hours);
         _swap(150);
         assertEq(sys.reqCount(), 0);
@@ -138,11 +172,14 @@ contract GuardReactiveTest is Test {
 
     function test_ignoresOtherChainsAndUnknownPools() public {
         _watch(1, -100, 100, 1);
-        IReactive.LogRecord memory l = _log(pool, SWAP, 0, 0, abi.encode(int256(1), int256(-1), uint160(1), uint128(1), int24(500)));
+        IReactive.LogRecord memory l =
+            _log(pool, SWAP, 0, 0, abi.encode(int256(1), int256(-1), uint160(1), uint128(1), int24(500)));
         l.chainId = 1;
-        vm.prank(SYSTEM); rx.react(l);
+        vm.prank(SYSTEM);
+        rx.react(l);
         _skip(10);
-        vm.prank(SYSTEM); rx.react(l);
+        vm.prank(SYSTEM);
+        rx.react(l);
         assertEq(sys.reqCount(), 0);
     }
 }

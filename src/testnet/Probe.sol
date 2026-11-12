@@ -32,7 +32,8 @@ contract ProbeGuard is AbstractCallback {
 
     mapping(uint256 => uint256) public closedAt;
 
-    constructor(address callbackProxy_, address reactive_) payable
+    constructor(address callbackProxy_, address reactive_)
+        payable
         AbstractCallback(IPayable(payable(callbackProxy_)), reactive_)
     {}
 
@@ -40,7 +41,11 @@ contract ProbeGuard is AbstractCallback {
         emit Watch(tokenId, pool, lo, hi, grace);
     }
 
-    function closeByReactive(address sender_, uint256 tokenId) external onlyServiceProvider onlyCallbackSender(sender_) {
+    function closeByReactive(address sender_, uint256 tokenId)
+        external
+        onlyServiceProvider
+        onlyCallbackSender(sender_)
+    {
         closedAt[tokenId] = block.timestamp;
         emit ClosedByReactive(tokenId, block.timestamp);
         emit Unwatch(tokenId);

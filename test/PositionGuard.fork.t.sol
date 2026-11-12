@@ -38,22 +38,23 @@ contract PositionGuardForkTest is Test {
         vm.startPrank(user);
         IERC20Approve(AERO).approve(NPM, type(uint256).max);
         IERC20Approve(WETH).approve(NPM, type(uint256).max);
-        (tokenId,,,) = INonfungiblePositionManager(NPM).mint(
-            INonfungiblePositionManager.MintParams({
-                token0: AERO,
-                token1: WETH,
-                tickSpacing: SPACING,
-                tickLower: mid - 5 * SPACING,
-                tickUpper: mid + 5 * SPACING,
-                amount0Desired: 1_000e18,
-                amount1Desired: 0.3e18,
-                amount0Min: 0,
-                amount1Min: 0,
-                recipient: user,
-                deadline: block.timestamp,
-                sqrtPriceX96: 0
-            })
-        );
+        (tokenId,,,) = INonfungiblePositionManager(NPM)
+            .mint(
+                INonfungiblePositionManager.MintParams({
+                    token0: AERO,
+                    token1: WETH,
+                    tickSpacing: SPACING,
+                    tickLower: mid - 5 * SPACING,
+                    tickUpper: mid + 5 * SPACING,
+                    amount0Desired: 1_000e18,
+                    amount1Desired: 0.3e18,
+                    amount0Min: 0,
+                    amount1Min: 0,
+                    recipient: user,
+                    deadline: block.timestamp,
+                    sqrtPriceX96: 0
+                })
+            );
         INonfungiblePositionManager(NPM).approve(address(guard), tokenId);
         vm.stopPrank();
     }

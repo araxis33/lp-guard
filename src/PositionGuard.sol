@@ -27,7 +27,14 @@ contract PositionGuard is AbstractCallback {
 
     event Deposited(uint256 indexed tokenId, address indexed owner, address gauge);
     event Withdrawn(uint256 indexed tokenId, address indexed owner);
-    event Closed(uint256 indexed tokenId, address indexed owner, address indexed by, uint256 amount0, uint256 amount1, uint256 aeroPaid);
+    event Closed(
+        uint256 indexed tokenId,
+        address indexed owner,
+        address indexed by,
+        uint256 amount0,
+        uint256 amount1,
+        uint256 aeroPaid
+    );
     /// @dev Read by the Reactive contract: start watching this position.
     event Watch(uint256 indexed tokenId, address indexed pool, int24 tickLower, int24 tickUpper, uint32 graceSeconds);
     /// @dev Read by the Reactive contract: stop watching.
@@ -54,7 +61,8 @@ contract PositionGuard is AbstractCallback {
     /// @dev Any ETH sent along stays in the guard and pays for the Reactive callback.
     function deposit(uint256 tokenId, bool stake, uint32 graceSeconds) external payable {
         npm.transferFrom(msg.sender, address(this), tokenId);
-        (,, address token0, address token1, int24 tickSpacing, int24 tickLower, int24 tickUpper,,,,,) = npm.positions(tokenId);
+        (,, address token0, address token1, int24 tickSpacing, int24 tickLower, int24 tickUpper,,,,,) =
+            npm.positions(tokenId);
         address pool = ICLFactory(npm.factory()).getPool(token0, token1, tickSpacing);
         address gauge;
         if (stake) {
@@ -91,7 +99,11 @@ contract PositionGuard is AbstractCallback {
 
     /// @notice Same close, asked for by the Reactive contract. `sender_` is filled in by the
     ///         callback proxy with the Reactive contract's address.
-    function closeByReactive(address sender_, uint256 tokenId) external onlyServiceProvider onlyCallbackSender(sender_) {
+    function closeByReactive(address sender_, uint256 tokenId)
+        external
+        onlyServiceProvider
+        onlyCallbackSender(sender_)
+    {
         Guarded memory g = guarded[tokenId];
         if (g.owner == address(0)) return; // already closed or withdrawn: nothing to do
         _close(tokenId, g);
@@ -106,20 +118,13 @@ contract PositionGuard is AbstractCallback {
         if (liquidity > 0) {
             npm.decreaseLiquidity(
                 INonfungiblePositionManager.DecreaseLiquidityParams({
-                    tokenId: tokenId,
-                    liquidity: liquidity,
-                    amount0Min: 0,
-                    amount1Min: 0,
-                    deadline: block.timestamp
+                    tokenId: tokenId, liquidity: liquidity, amount0Min: 0, amount1Min: 0, deadline: block.timestamp
                 })
             );
         }
         (uint256 amount0, uint256 amount1) = npm.collect(
             INonfungiblePositionManager.CollectParams({
-                tokenId: tokenId,
-                recipient: g.owner,
-                amount0Max: type(uint128).max,
-                amount1Max: type(uint128).max
+                tokenId: tokenId, recipient: g.owner, amount0Max: type(uint128).max, amount1Max: type(uint128).max
             })
         );
         npm.transferFrom(address(this), g.owner, tokenId);
