@@ -8,6 +8,8 @@ pragma solidity ^0.8.24;
 interface IERC20 {
     function balanceOf(address) external view returns (uint256);
     function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function approve(address spender, uint256 amount) external returns (bool);
 }
 
 interface INonfungiblePositionManager {
@@ -84,6 +86,21 @@ interface ICLFactory {
 
 interface ICLPool {
     function gauge() external view returns (address);
+    function factory() external view returns (address);
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function tickSpacing() external view returns (int24);
+    function slot0()
+        external
+        view
+        returns (
+            uint160 sqrtPriceX96,
+            int24 tick,
+            uint16 observationIndex,
+            uint16 observationCardinality,
+            uint16 observationCardinalityNext,
+            bool unlocked
+        );
 }
 
 interface ICLGauge {

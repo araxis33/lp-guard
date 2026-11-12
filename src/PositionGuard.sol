@@ -10,7 +10,8 @@ import {IPayable} from "@reactive/src/interfaces/IPayable.sol";
 ///         and can close it and send everything back to the user when told to.
 ///
 ///         Who can do what:
-///         - the position's owner: put it in, take it back untouched, or close it at any time;
+///         - the position's owner: open one in a single step (`open`) or hand in an existing one
+///           (`deposit`), take it back untouched, or close it at any time;
 ///         - the Reactive contract (through the callback proxy): only close it. Everything from a
 ///           close goes to the owner, so the worst it can do is close a position early. It can
 ///           never take funds. Nobody else can do anything.
@@ -42,6 +43,22 @@ contract PositionGuard is AbstractCallback {
 
     error NotOwner();
     error NotGuarded();
+    error UnknownPool();
+    error BadWidth();
+
+    // TransferFailed() comes from AbstractPayer (via AbstractCallback).
+
+    /// @notice What `open` needs. The range is placed around the pool's current price.
+    struct OpenParams {
+        address pool; // an Aero Slipstream pool; checked against the factory
+        uint256 amount0; // most of token0 to put in
+        uint256 amount1; // most of token1 to put in
+        uint16 halfWidth; // range = current price ± halfWidth tick spacings (at least 1)
+        uint256 amount0Min; // slippage guard: least token0 that must go in
+        uint256 amount1Min; // slippage guard: least token1 that must go in
+        bool stake; // stake in the gauge to earn AERO
+        uint32 graceSeconds; // automatic close after this long out of range; 0 = off
+    }
 
     /// @param callbackProxy_ Reactive's callback proxy on this chain.
     /// @param reactive_ The Reactive contract allowed to ask for a close.
@@ -61,18 +78,51 @@ contract PositionGuard is AbstractCallback {
     /// @dev Any ETH sent along stays in the guard and pays for the Reactive callback.
     function deposit(uint256 tokenId, bool stake, uint32 graceSeconds) external payable {
         npm.transferFrom(msg.sender, address(this), tokenId);
-        (,, address token0, address token1, int24 tickSpacing, int24 tickLower, int24 tickUpper,,,,,) =
-            npm.positions(tokenId);
-        address pool = ICLFactory(npm.factory()).getPool(token0, token1, tickSpacing);
-        address gauge;
-        if (stake) {
-            gauge = ICLPool(pool).gauge();
-            npm.approve(gauge, tokenId);
-            ICLGauge(gauge).deposit(tokenId);
-        }
-        guarded[tokenId] = Guarded(msg.sender, gauge);
-        emit Deposited(tokenId, msg.sender, gauge);
-        if (graceSeconds > 0) emit Watch(tokenId, pool, tickLower, tickUpper, graceSeconds);
+        _guard(tokenId, msg.sender, stake, graceSeconds);
+    }
+
+    /// @notice One step in: take the two tokens, open a position around the current price in
+    ///         `p.pool`, stake it, and guard it for the caller. Whatever the pool did not take is
+    ///         sent straight back. The caller must have approved the guard for both amounts.
+    /// @dev Any ETH sent along stays in the guard and pays for the Reactive callback.
+    function open(OpenParams calldata p) external payable returns (uint256 tokenId) {
+        if (p.halfWidth == 0) revert BadWidth();
+        ICLPool pool = ICLPool(p.pool);
+        address token0 = pool.token0();
+        address token1 = pool.token1();
+        int24 spacing = pool.tickSpacing();
+        // Only real pools of the factory the position manager mints into.
+        if (ICLFactory(npm.factory()).getPool(token0, token1, spacing) != p.pool) revert UnknownPool();
+
+        (, int24 tick,,,,) = pool.slot0();
+        int24 base = tick / spacing;
+        if (tick < 0 && tick % spacing != 0) base -= 1; // round down for negative ticks
+        int24 lower = (base - int24(uint24(p.halfWidth))) * spacing;
+        int24 upper = (base + 1 + int24(uint24(p.halfWidth))) * spacing;
+
+        _pull(token0, p.amount0);
+        _pull(token1, p.amount1);
+
+        (tokenId,,,) = npm.mint(
+            INonfungiblePositionManager.MintParams({
+                token0: token0,
+                token1: token1,
+                tickSpacing: spacing,
+                tickLower: lower,
+                tickUpper: upper,
+                amount0Desired: p.amount0,
+                amount1Desired: p.amount1,
+                amount0Min: p.amount0Min,
+                amount1Min: p.amount1Min,
+                recipient: address(this),
+                deadline: block.timestamp,
+                sqrtPriceX96: 0
+            })
+        );
+
+        _refund(token0);
+        _refund(token1);
+        _guard(tokenId, msg.sender, p.stake, p.graceSeconds);
     }
 
     /// @notice Take the position back as it is, with any AERO it earned.
@@ -151,6 +201,37 @@ contract PositionGuard is AbstractCallback {
     }
 
     // ---- internals ----
+
+    /// @dev Records the owner, stakes if asked, and tells the Reactive contract what to watch.
+    function _guard(uint256 tokenId, address owner, bool stake, uint32 graceSeconds) internal {
+        (,, address token0, address token1, int24 tickSpacing, int24 tickLower, int24 tickUpper,,,,,) =
+            npm.positions(tokenId);
+        address pool = ICLFactory(npm.factory()).getPool(token0, token1, tickSpacing);
+        address gauge;
+        if (stake) {
+            gauge = ICLPool(pool).gauge();
+            npm.approve(gauge, tokenId);
+            ICLGauge(gauge).deposit(tokenId);
+        }
+        guarded[tokenId] = Guarded(owner, gauge);
+        emit Deposited(tokenId, owner, gauge);
+        if (graceSeconds > 0) emit Watch(tokenId, pool, tickLower, tickUpper, graceSeconds);
+    }
+
+    /// @dev Takes `amount` of `token` from the caller and lets the position manager spend exactly that.
+    function _pull(address token, uint256 amount) internal {
+        if (amount == 0) return;
+        if (!IERC20(token).transferFrom(msg.sender, address(this), amount)) revert TransferFailed();
+        if (!IERC20(token).approve(address(npm), amount)) revert TransferFailed();
+    }
+
+    /// @dev Sends back what the mint did not use and clears the leftover allowance.
+    ///      The guard never holds tokens between calls, so its whole balance is the leftover.
+    function _refund(address token) internal {
+        IERC20(token).approve(address(npm), 0);
+        uint256 left = IERC20(token).balanceOf(address(this));
+        if (left > 0 && !IERC20(token).transfer(msg.sender, left)) revert TransferFailed();
+    }
 
     /// @dev Claims the position's AERO to its owner and takes the NFT out of the gauge.
     ///      AERO is measured by the owner's balance so it is right whether the gauge pays on
