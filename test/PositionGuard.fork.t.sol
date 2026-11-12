@@ -238,6 +238,98 @@ contract PositionGuardForkTest is Test {
         vm.stopPrank();
         assertGt(IERC20(WETH).balanceOf(user), w0);
     }
+
+    // ---- one-step entry from a single token (`openWith`) ----
+
+    address constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
+    address constant USDC_AERO = 0xD0Acf293547457Fb4fE9eE32CA93e89497626816; // CL200
+    address constant WETH_USDC = 0x4A7af46bC8aBc00048c6c7920a1488DAF568366c; // CL50
+
+    function _leg(address pool, uint256 amountIn, uint256 minOut) internal pure returns (PositionGuard.SwapLeg memory) {
+        return PositionGuard.SwapLeg({pool: pool, amountIn: amountIn, minOut: minOut});
+    }
+
+    function _fundUsdc(uint256 amount) internal {
+        deal(USDC, user, amount);
+        deal(AERO, user, 0);
+        deal(WETH, user, 0);
+        vm.prank(user);
+        IERC20Approve(USDC).approve(address(guard), type(uint256).max);
+    }
+
+    function test_openWith_usdcOnly_opensStakesAndLeavesNothingBehind() public {
+        _fundUsdc(200e6);
+        vm.prank(user);
+        uint256 id =
+            guard.openWith(USDC, 200e6, _leg(USDC_AERO, 100e6, 1), _leg(WETH_USDC, 100e6, 1), _openParams(0, 0));
+
+        (address owner, address gauge) = guard.guarded(id);
+        assertEq(owner, user);
+        assertEq(INonfungiblePositionManager(NPM).ownerOf(id), gauge, "staked");
+        (,,,,,,, uint128 liq,,,,) = INonfungiblePositionManager(NPM).positions(id);
+        assertGt(liq, 0, "liquidity added");
+
+        assertEq(IERC20(USDC).balanceOf(address(guard)), 0, "no USDC left in the guard");
+        assertEq(IERC20(AERO).balanceOf(address(guard)), 0, "no AERO left in the guard");
+        assertEq(IERC20(WETH).balanceOf(address(guard)), 0, "no WETH left in the guard");
+        console2.log("leftover back to user - AERO:", IERC20(AERO).balanceOf(user));
+        console2.log("leftover back to user - WETH:", IERC20(WETH).balanceOf(user));
+        console2.log("leftover back to user - USDC:", IERC20(USDC).balanceOf(user));
+
+        // And the owner can still leave at once with everything.
+        vm.prank(user);
+        guard.close(id);
+        assertEq(IERC20(AERO).balanceOf(address(guard)), 0);
+        assertEq(IERC20(WETH).balanceOf(address(guard)), 0);
+        console2.log("after close - AERO:", IERC20(AERO).balanceOf(user));
+        console2.log("after close - WETH:", IERC20(WETH).balanceOf(user));
+    }
+
+    function test_openWith_payWithPoolToken_onlyOneSwap() public {
+        deal(WETH, user, 0.1e18);
+        deal(AERO, user, 0);
+        vm.startPrank(user);
+        IERC20Approve(WETH).approve(address(guard), type(uint256).max);
+        // Pay in WETH (token1): half is swapped into AERO in the same pool, the rest goes in as is.
+        uint256 id = guard.openWith(WETH, 0.1e18, _leg(POOL, 0.05e18, 1), _leg(address(0), 0, 0), _openParams(0, 0));
+        vm.stopPrank();
+        (,,,,,,, uint128 liq,,,,) = INonfungiblePositionManager(NPM).positions(id);
+        assertGt(liq, 0);
+        assertEq(IERC20(WETH).balanceOf(address(guard)), 0);
+        assertEq(IERC20(AERO).balanceOf(address(guard)), 0);
+    }
+
+    function test_openWith_priceMoved_revertsAndUserKeepsMoney() public {
+        _fundUsdc(200e6);
+        vm.prank(user);
+        vm.expectRevert(PositionGuard.TooLittleReceived.selector);
+        // Asking for an absurd amount of AERO for 100 USDC = the price "moved" against us.
+        guard.openWith(USDC, 200e6, _leg(USDC_AERO, 100e6, 1_000_000e18), _leg(WETH_USDC, 100e6, 1), _openParams(0, 0));
+        assertEq(IERC20(USDC).balanceOf(user), 200e6, "nothing was taken");
+    }
+
+    function test_openWith_rejectsWrongSwapPoolAndBadSplit() public {
+        _fundUsdc(200e6);
+        vm.startPrank(user);
+        // USDC/WETH pool offered as the route to AERO
+        vm.expectRevert(PositionGuard.BadSwapPool.selector);
+        guard.openWith(USDC, 200e6, _leg(WETH_USDC, 100e6, 1), _leg(WETH_USDC, 100e6, 1), _openParams(0, 0));
+        // swaps add up to more than was paid
+        vm.expectRevert(PositionGuard.BadSplit.selector);
+        guard.openWith(USDC, 100e6, _leg(USDC_AERO, 100e6, 1), _leg(WETH_USDC, 100e6, 1), _openParams(0, 0));
+        vm.stopPrank();
+    }
+
+    function test_swapCallback_onlyThePoolBeingSwappedIn() public {
+        deal(USDC, address(guard), 50e6); // even if the guard held something
+        vm.prank(stranger);
+        vm.expectRevert(PositionGuard.NotSwapPool.selector);
+        guard.uniswapV3SwapCallback(int256(50e6), 0, abi.encode(USDC));
+        // a real pool calling on its own, outside a swap, gets nothing either
+        vm.prank(USDC_AERO);
+        vm.expectRevert(PositionGuard.NotSwapPool.selector);
+        guard.uniswapV3SwapCallback(int256(50e6), 0, abi.encode(USDC));
+    }
 }
 
 /// Looks like a pool but is not one the factory made.
