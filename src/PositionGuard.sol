@@ -45,6 +45,23 @@ contract PositionGuard is AbstractCallback {
     error NotGuarded();
     error UnknownPool();
     error BadWidth();
+    error BadSplit();
+    error BadSwapPool();
+    error TooLittleReceived();
+    error NotSwapPool();
+
+    /// @notice One swap of the payment token into one of the pool's tokens.
+    struct SwapLeg {
+        address pool; // an Aero Slipstream pool of tokenIn and the target token
+        uint256 amountIn; // how much tokenIn to swap
+        uint256 minOut; // revert if the swap gives less than this
+    }
+
+    uint160 internal constant MIN_SQRT_RATIO = 4295128739;
+    uint160 internal constant MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342;
+
+    /// @dev The pool the guard is swapping in right now; only it may ask to be paid.
+    address internal swapPool;
 
     // TransferFailed() comes from AbstractPayer (via AbstractCallback).
 
@@ -87,42 +104,48 @@ contract PositionGuard is AbstractCallback {
     /// @dev Any ETH sent along stays in the guard and pays for the Reactive callback.
     function open(OpenParams calldata p) external payable returns (uint256 tokenId) {
         if (p.halfWidth == 0) revert BadWidth();
-        ICLPool pool = ICLPool(p.pool);
-        address token0 = pool.token0();
-        address token1 = pool.token1();
-        int24 spacing = pool.tickSpacing();
-        // Only real pools of the factory the position manager mints into.
-        if (ICLFactory(npm.factory()).getPool(token0, token1, spacing) != p.pool) revert UnknownPool();
-
-        (, int24 tick,,,,) = pool.slot0();
-        int24 base = tick / spacing;
-        if (tick < 0 && tick % spacing != 0) base -= 1; // round down for negative ticks
-        int24 lower = (base - int24(uint24(p.halfWidth))) * spacing;
-        int24 upper = (base + 1 + int24(uint24(p.halfWidth))) * spacing;
-
+        (address token0, address token1) = _poolTokens(p.pool);
         _pull(token0, p.amount0);
         _pull(token1, p.amount1);
-
-        (tokenId,,,) = npm.mint(
-            INonfungiblePositionManager.MintParams({
-                token0: token0,
-                token1: token1,
-                tickSpacing: spacing,
-                tickLower: lower,
-                tickUpper: upper,
-                amount0Desired: p.amount0,
-                amount1Desired: p.amount1,
-                amount0Min: p.amount0Min,
-                amount1Min: p.amount1Min,
-                recipient: address(this),
-                deadline: block.timestamp,
-                sqrtPriceX96: 0
-            })
-        );
-
+        tokenId = _mintAndGuard(p, token0, token1, p.amount0, p.amount1);
         _refund(token0);
         _refund(token1);
-        _guard(tokenId, msg.sender, p.stake, p.graceSeconds);
+    }
+
+    /// @notice One step in from a single token (for example USDC): part of it is swapped into the
+    ///         pool's two tokens, then the position is opened, staked and guarded as in `open`.
+    ///         Whatever is left of any of the three tokens goes straight back to the caller.
+    /// @param tokenIn the token the caller pays with; may be one of the pool's own tokens.
+    /// @param amountIn how much of it to take. The caller must have approved the guard.
+    /// @param to0 swap of `tokenIn` into the pool's token0 (skipped when `tokenIn` is token0).
+    /// @param to1 swap of `tokenIn` into the pool's token1 (skipped when `tokenIn` is token1).
+    /// @param p the position to open; `p.amount0` and `p.amount1` are ignored: everything the swaps
+    ///        produced (plus any `tokenIn` that is a pool token) is offered to the pool.
+    /// @dev The split between the two swaps and the `minOut` floors are worked out off-chain by the
+    ///      page from the pool's current price; the floors make a moved price revert, not lose money.
+    function openWith(
+        address tokenIn,
+        uint256 amountIn,
+        SwapLeg calldata to0,
+        SwapLeg calldata to1,
+        OpenParams calldata p
+    ) external payable returns (uint256 tokenId) {
+        if (p.halfWidth == 0) revert BadWidth();
+        (address token0, address token1) = _poolTokens(p.pool);
+        if (to0.amountIn + to1.amountIn > amountIn) revert BadSplit();
+        if (!IERC20(tokenIn).transferFrom(msg.sender, address(this), amountIn)) revert TransferFailed();
+
+        if (tokenIn != token0) _swap(to0.pool, tokenIn, token0, to0.amountIn, to0.minOut);
+        if (tokenIn != token1) _swap(to1.pool, tokenIn, token1, to1.amountIn, to1.minOut);
+
+        uint256 amount0 = IERC20(token0).balanceOf(address(this));
+        uint256 amount1 = IERC20(token1).balanceOf(address(this));
+        IERC20(token0).approve(address(npm), amount0);
+        IERC20(token1).approve(address(npm), amount1);
+        tokenId = _mintAndGuard(p, token0, token1, amount0, amount1);
+        _refund(token0);
+        _refund(token1);
+        if (tokenIn != token0 && tokenIn != token1) _refund(tokenIn);
     }
 
     /// @notice Take the position back as it is, with any AERO it earned.
@@ -200,7 +223,78 @@ contract PositionGuard is AbstractCallback {
         return ICLGauge(g.gauge).earned(address(this), ids);
     }
 
+    /// @notice Called by a pool during `_swap` to be paid. Only the pool the guard is swapping in
+    ///         right now gets anything, and only the amount it is owed.
+    function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external {
+        if (msg.sender != swapPool || msg.sender == address(0)) revert NotSwapPool();
+        address tokenIn = abi.decode(data, (address));
+        uint256 owed = uint256(amount0Delta > 0 ? amount0Delta : amount1Delta);
+        if (!IERC20(tokenIn).transfer(msg.sender, owed)) revert TransferFailed();
+    }
+
     // ---- internals ----
+
+    /// @dev The pool's two tokens, after checking it is a real pool of the position manager's factory.
+    function _poolTokens(address pool) internal view returns (address token0, address token1) {
+        token0 = ICLPool(pool).token0();
+        token1 = ICLPool(pool).token1();
+        if (ICLFactory(npm.factory()).getPool(token0, token1, ICLPool(pool).tickSpacing()) != pool) {
+            revert UnknownPool();
+        }
+    }
+
+    /// @dev Opens the position around the current price and guards it for the caller.
+    ///      The position manager must already be approved for `amount0` and `amount1`.
+    function _mintAndGuard(OpenParams calldata p, address token0, address token1, uint256 amount0, uint256 amount1)
+        internal
+        returns (uint256 tokenId)
+    {
+        int24 spacing = ICLPool(p.pool).tickSpacing();
+        (, int24 tick,,,,) = ICLPool(p.pool).slot0();
+        int24 base = tick / spacing;
+        if (tick < 0 && tick % spacing != 0) base -= 1; // round down for negative ticks
+        int24 half = int24(uint24(p.halfWidth));
+
+        (tokenId,,,) = npm.mint(
+            INonfungiblePositionManager.MintParams({
+                token0: token0,
+                token1: token1,
+                tickSpacing: spacing,
+                tickLower: (base - half) * spacing,
+                tickUpper: (base + 1 + half) * spacing,
+                amount0Desired: amount0,
+                amount1Desired: amount1,
+                amount0Min: p.amount0Min,
+                amount1Min: p.amount1Min,
+                recipient: address(this),
+                deadline: block.timestamp,
+                sqrtPriceX96: 0
+            })
+        );
+        _guard(tokenId, msg.sender, p.stake, p.graceSeconds);
+    }
+
+    /// @dev Swaps exactly `amountIn` of `tokenIn` (or less, if the pool runs out) for `tokenOut`
+    ///      in `pool`, which must be a real pool of exactly these two tokens.
+    function _swap(address pool, address tokenIn, address tokenOut, uint256 amountIn, uint256 minOut) internal {
+        if (amountIn == 0) return;
+        (address t0, address t1) = _poolTokens(pool);
+        bool zeroForOne = tokenIn == t0;
+        if (zeroForOne ? t1 != tokenOut : (t1 != tokenIn || t0 != tokenOut)) revert BadSwapPool();
+
+        uint256 before = IERC20(tokenOut).balanceOf(address(this));
+        swapPool = pool;
+        ICLPool(pool)
+            .swap(
+                address(this),
+                zeroForOne,
+                int256(amountIn),
+                zeroForOne ? MIN_SQRT_RATIO + 1 : MAX_SQRT_RATIO - 1,
+                abi.encode(tokenIn)
+            );
+        swapPool = address(0);
+        if (IERC20(tokenOut).balanceOf(address(this)) - before < minOut) revert TooLittleReceived();
+    }
 
     /// @dev Records the owner, stakes if asked, and tells the Reactive contract what to watch.
     function _guard(uint256 tokenId, address owner, bool stake, uint32 graceSeconds) internal {
