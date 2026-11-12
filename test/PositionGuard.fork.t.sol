@@ -131,6 +131,105 @@ contract PositionGuardForkTest is Test {
         assertEq(afterLiq, before, "liquidity untouched");
     }
 
+    // ---- one-step entry (`open`) and the owner's safety ----
+
+    function _openParams(uint256 a0, uint256 a1) internal pure returns (PositionGuard.OpenParams memory) {
+        return PositionGuard.OpenParams({
+            pool: POOL,
+            amount0: a0,
+            amount1: a1,
+            halfWidth: 5,
+            amount0Min: 0,
+            amount1Min: 0,
+            stake: true,
+            graceSeconds: 3 hours
+        });
+    }
+
+    function _openAsUser() internal returns (uint256 id) {
+        deal(AERO, user, 1_000e18);
+        deal(WETH, user, 1e18);
+        vm.startPrank(user);
+        IERC20Approve(AERO).approve(address(guard), type(uint256).max);
+        IERC20Approve(WETH).approve(address(guard), type(uint256).max);
+        id = guard.open(_openParams(1_000e18, 1e18));
+        vm.stopPrank();
+    }
+
+    function test_open_mintsAroundPrice_stakes_refundsTheRest() public {
+        uint256 id = _openAsUser();
+
+        (address owner, address gauge) = guard.guarded(id);
+        assertEq(owner, user, "user owns the guarded position");
+        assertEq(gauge, ICLPool(POOL).gauge(), "staked in the pool's gauge");
+        assertEq(INonfungiblePositionManager(NPM).ownerOf(id), gauge, "NFT sits in the gauge");
+
+        (,,,,, int24 lower, int24 upper, uint128 liq,,,,) = INonfungiblePositionManager(NPM).positions(id);
+        (, int24 tick) = _slot0();
+        assertTrue(lower <= tick && tick < upper, "current price inside the range");
+        assertEq(upper - lower, 11 * SPACING, "range is 2 x halfWidth + 1 spacings");
+        assertGt(liq, 0, "liquidity added");
+
+        // One side is used up, the other comes back; the guard keeps nothing.
+        assertEq(IERC20(AERO).balanceOf(address(guard)), 0, "no AERO left in the guard");
+        assertEq(IERC20(WETH).balanceOf(address(guard)), 0, "no WETH left in the guard");
+        assertTrue(IERC20(AERO).balanceOf(user) > 0 || IERC20(WETH).balanceOf(user) > 0, "unused side refunded");
+        console2.log("refunded AERO:", IERC20(AERO).balanceOf(user));
+        console2.log("refunded WETH:", IERC20(WETH).balanceOf(user));
+    }
+
+    function test_open_rejectsFakePool() public {
+        PositionGuard.OpenParams memory p = _openParams(1e18, 1e18);
+        p.pool = address(new FakePool(AERO, WETH));
+        vm.prank(user);
+        vm.expectRevert(PositionGuard.UnknownPool.selector);
+        guard.open(p);
+    }
+
+    function test_open_rejectsZeroWidth() public {
+        PositionGuard.OpenParams memory p = _openParams(1e18, 1e18);
+        p.halfWidth = 0;
+        vm.prank(user);
+        vm.expectRevert(PositionGuard.BadWidth.selector);
+        guard.open(p);
+    }
+
+    /// Safety: after a one-step entry nobody but the owner can touch the money, and the owner
+    /// can leave at any moment and gets everything back.
+    function test_open_strangerCannotTouch_ownerExitsWithEverything() public {
+        uint256 id = _openAsUser();
+        uint256 a0 = IERC20(AERO).balanceOf(user);
+        uint256 w0 = IERC20(WETH).balanceOf(user);
+
+        vm.startPrank(stranger);
+        vm.expectRevert(PositionGuard.NotOwner.selector);
+        guard.close(id);
+        vm.expectRevert(PositionGuard.NotOwner.selector);
+        guard.withdraw(id);
+        vm.stopPrank();
+
+        vm.warp(block.timestamp + 1 days);
+        vm.prank(user);
+        guard.close(id);
+
+        assertGt(IERC20(AERO).balanceOf(user), a0, "owner got AERO back (tokens + rewards)");
+        assertGt(IERC20(WETH).balanceOf(user), w0, "owner got WETH back");
+        assertEq(INonfungiblePositionManager(NPM).ownerOf(id), user, "empty NFT returned");
+        assertEq(IERC20(AERO).balanceOf(stranger), 0, "stranger got nothing");
+        assertEq(IERC20(AERO).balanceOf(address(guard)), 0, "guard keeps nothing");
+        assertEq(IERC20(WETH).balanceOf(address(guard)), 0, "guard keeps nothing");
+    }
+
+    function test_open_ownerCanTakeNftBackUntouched() public {
+        uint256 id = _openAsUser();
+        (,,,,,,, uint128 liqBefore,,,,) = INonfungiblePositionManager(NPM).positions(id);
+        vm.prank(user);
+        guard.withdraw(id);
+        assertEq(INonfungiblePositionManager(NPM).ownerOf(id), user);
+        (,,,,,,, uint128 liqAfter,,,,) = INonfungiblePositionManager(NPM).positions(id);
+        assertEq(liqAfter, liqBefore, "liquidity untouched");
+    }
+
     function test_unstakedDeposit_ownerCloses() public {
         vm.startPrank(user);
         guard.deposit(tokenId, false, 0);
@@ -138,5 +237,20 @@ contract PositionGuardForkTest is Test {
         guard.close(tokenId);
         vm.stopPrank();
         assertGt(IERC20(WETH).balanceOf(user), w0);
+    }
+}
+
+/// Looks like a pool but is not one the factory made.
+contract FakePool {
+    address public token0;
+    address public token1;
+
+    constructor(address t0, address t1) {
+        token0 = t0;
+        token1 = t1;
+    }
+
+    function tickSpacing() external pure returns (int24) {
+        return 200;
     }
 }
