@@ -330,6 +330,61 @@ contract PositionGuardForkTest is Test {
         vm.expectRevert(PositionGuard.NotSwapPool.selector);
         guard.uniswapV3SwapCallback(int256(50e6), 0, abi.encode(USDC));
     }
+
+    // ---- exit into a single token (`closeTo`) ----
+
+    function _openWithUsdc() internal returns (uint256 id) {
+        _fundUsdc(200e6);
+        vm.prank(user);
+        id = guard.openWith(USDC, 200e6, _leg(USDC_AERO, 100e6, 1), _leg(WETH_USDC, 100e6, 1), _openParams(0, 0));
+    }
+
+    function test_closeTo_fullCircle_usdcInUsdcOut() public {
+        uint256 id = _openWithUsdc();
+        uint256 usdcBefore = IERC20(USDC).balanceOf(user);
+        vm.warp(block.timestamp + 1 days);
+
+        vm.prank(user);
+        uint256 out = guard.closeTo(id, USDC, _leg(USDC_AERO, 0, 1), _leg(WETH_USDC, 0, 1));
+
+        uint256 got = IERC20(USDC).balanceOf(user) - usdcBefore;
+        console2.log("USDC in: 200, USDC back (6 decimals):", got);
+        assertEq(got, out, "reported amount matches");
+        assertGt(got, 190e6, "round trip loses only swap fees");
+        assertEq(INonfungiblePositionManager(NPM).ownerOf(id), user, "empty NFT returned");
+        (address owner,) = guard.guarded(id);
+        assertEq(owner, address(0), "no longer guarded");
+        assertEq(IERC20(USDC).balanceOf(address(guard)), 0, "guard keeps nothing");
+        assertEq(IERC20(AERO).balanceOf(address(guard)), 0, "guard keeps nothing");
+        assertEq(IERC20(WETH).balanceOf(address(guard)), 0, "guard keeps nothing");
+    }
+
+    function test_closeTo_priceMoved_revertsAndPositionStays() public {
+        uint256 id = _openWithUsdc();
+        vm.prank(user);
+        vm.expectRevert(PositionGuard.TooLittleReceived.selector);
+        guard.closeTo(id, USDC, _leg(USDC_AERO, 0, 1_000_000e6), _leg(WETH_USDC, 0, 1));
+        (address owner,) = guard.guarded(id);
+        assertEq(owner, user, "still guarded, nothing lost");
+    }
+
+    function test_closeTo_ownerOnly() public {
+        uint256 id = _openWithUsdc();
+        vm.prank(stranger);
+        vm.expectRevert(PositionGuard.NotOwner.selector);
+        guard.closeTo(id, USDC, _leg(USDC_AERO, 0, 1), _leg(WETH_USDC, 0, 1));
+    }
+
+    function test_closeTo_intoPoolToken_oneSwap() public {
+        uint256 id = _openWithUsdc();
+        uint256 wethBefore = IERC20(WETH).balanceOf(user);
+        vm.prank(user);
+        // all out in WETH: AERO (token0) is swapped in the AERO/WETH pool itself
+        guard.closeTo(id, WETH, _leg(POOL, 0, 1), _leg(address(0), 0, 0));
+        assertGt(IERC20(WETH).balanceOf(user), wethBefore);
+        assertEq(IERC20(AERO).balanceOf(address(guard)), 0);
+        assertEq(IERC20(WETH).balanceOf(address(guard)), 0);
+    }
 }
 
 /// Looks like a pool but is not one the factory made.
