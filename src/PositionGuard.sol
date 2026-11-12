@@ -153,7 +153,7 @@ contract PositionGuard is AbstractCallback {
         Guarded memory g = guarded[tokenId];
         if (g.owner != msg.sender) revert NotOwner();
         delete guarded[tokenId];
-        _unstake(tokenId, g);
+        _unstake(tokenId, g, g.owner);
         npm.transferFrom(address(this), g.owner, tokenId);
         emit Withdrawn(tokenId, g.owner);
         emit Unwatch(tokenId);
@@ -167,7 +167,40 @@ contract PositionGuard is AbstractCallback {
         Guarded memory g = guarded[tokenId];
         if (g.owner == address(0)) revert NotGuarded();
         if (msg.sender != g.owner) revert NotOwner();
-        _close(tokenId, g);
+        _close(tokenId, g, g.owner);
+    }
+
+    /// @notice Close the position and get it all back in one token (for example USDC): both of the
+    ///         pool's tokens are swapped into `tokenOut`; AERO earned is swapped too when it is one
+    ///         of the pool's tokens, otherwise it is sent as AERO. Owner only.
+    /// @param from0 swap of the pool's token0 into `tokenOut` (skipped when token0 is `tokenOut`);
+    ///        its `amountIn` is ignored: everything the position returned is swapped.
+    /// @param from1 the same for token1.
+    /// @return out how much `tokenOut` the owner received.
+    /// @dev The `minOut` floors are worked out off-chain by the page from the position's current
+    ///      amounts; if the price moved, the whole close reverts and the position stays as it was.
+    function closeTo(uint256 tokenId, address tokenOut, SwapLeg calldata from0, SwapLeg calldata from1)
+        external
+        returns (uint256 out)
+    {
+        Guarded memory g = guarded[tokenId];
+        if (g.owner == address(0)) revert NotGuarded();
+        if (msg.sender != g.owner) revert NotOwner();
+        (,, address token0, address token1,,,,,,,,) = npm.positions(tokenId);
+
+        _close(tokenId, g, address(this));
+
+        if (token0 != tokenOut) {
+            _swap(from0.pool, token0, tokenOut, IERC20(token0).balanceOf(address(this)), from0.minOut);
+        }
+        if (token1 != tokenOut) {
+            _swap(from1.pool, token1, tokenOut, IERC20(token1).balanceOf(address(this)), from1.minOut);
+        }
+        out = IERC20(tokenOut).balanceOf(address(this));
+        _refund(tokenOut);
+        _refund(token0);
+        _refund(token1);
+        _refund(address(aero));
     }
 
     /// @notice Same close, asked for by the Reactive contract. `sender_` is filled in by the
@@ -179,13 +212,15 @@ contract PositionGuard is AbstractCallback {
     {
         Guarded memory g = guarded[tokenId];
         if (g.owner == address(0)) return; // already closed or withdrawn: nothing to do
-        _close(tokenId, g);
+        _close(tokenId, g, g.owner);
     }
 
-    function _close(uint256 tokenId, Guarded memory g) internal {
+    /// @dev Unstakes, removes all liquidity and sends the tokens, fees and AERO to `to` (the owner,
+    ///      or the guard itself when `closeTo` swaps them first). The empty NFT always goes to the owner.
+    function _close(uint256 tokenId, Guarded memory g, address to) internal {
         delete guarded[tokenId];
 
-        uint256 aeroPaid = _unstake(tokenId, g);
+        uint256 aeroPaid = _unstake(tokenId, g, to);
 
         (,,,,,,, uint128 liquidity,,,,) = npm.positions(tokenId);
         if (liquidity > 0) {
@@ -197,7 +232,7 @@ contract PositionGuard is AbstractCallback {
         }
         (uint256 amount0, uint256 amount1) = npm.collect(
             INonfungiblePositionManager.CollectParams({
-                tokenId: tokenId, recipient: g.owner, amount0Max: type(uint128).max, amount1Max: type(uint128).max
+                tokenId: tokenId, recipient: to, amount0Max: type(uint128).max, amount1Max: type(uint128).max
             })
         );
         npm.transferFrom(address(this), g.owner, tokenId);
@@ -327,21 +362,23 @@ contract PositionGuard is AbstractCallback {
         if (left > 0 && !IERC20(token).transfer(msg.sender, left)) revert TransferFailed();
     }
 
-    /// @dev Claims the position's AERO to its owner and takes the NFT out of the gauge.
-    ///      AERO is measured by the owner's balance so it is right whether the gauge pays on
+    /// @dev Claims the position's AERO to `to` and takes the NFT out of the gauge.
+    ///      AERO is measured by the balance of `to` so it is right whether the gauge pays on
     ///      claim, on withdraw, or both.
-    function _unstake(uint256 tokenId, Guarded memory g) internal returns (uint256 aeroPaid) {
+    function _unstake(uint256 tokenId, Guarded memory g, address to) internal returns (uint256 aeroPaid) {
         if (g.gauge == address(0)) return 0;
-        uint256 ownerBefore = aero.balanceOf(g.owner);
+        uint256 toBefore = aero.balanceOf(to);
         uint256 selfBefore = aero.balanceOf(address(this));
         uint256[] memory ids = new uint256[](1);
         ids[0] = tokenId;
-        ICLGauge(g.gauge).claimEmissions(address(this), g.owner, ids);
+        ICLGauge(g.gauge).claimEmissions(address(this), to, ids);
         ICLGauge(g.gauge).withdraw(tokenId);
         // Anything the gauge paid to the guard itself on withdraw belongs to this position's owner.
-        uint256 stray = aero.balanceOf(address(this)) - selfBefore;
-        if (stray > 0) aero.transfer(g.owner, stray);
-        aeroPaid = aero.balanceOf(g.owner) - ownerBefore;
+        if (to != address(this)) {
+            uint256 stray = aero.balanceOf(address(this)) - selfBefore;
+            if (stray > 0) aero.transfer(to, stray);
+        }
+        aeroPaid = aero.balanceOf(to) - toBefore;
     }
 
     function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
