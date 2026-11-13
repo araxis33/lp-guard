@@ -90,6 +90,8 @@ interface ICLPool {
     function token0() external view returns (address);
     function token1() external view returns (address);
     function tickSpacing() external view returns (int24);
+    /// AERO paid so far per unit of in-range staked liquidity, X128.
+    function rewardGrowthGlobalX128() external view returns (uint256);
     function swap(
         address recipient,
         bool zeroForOne,

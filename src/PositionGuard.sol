@@ -58,6 +58,24 @@ contract PositionGuard is AbstractCallback {
     uint256 internal reviewCursor; // where the next daily run starts
     mapping(uint256 tokenId => uint256) internal reviewSlot; // index + 1; 0 = not listed
 
+    /// @notice Most other pools an owner may name for a position to move into.
+    uint256 public constant MAX_ALTERNATES = 3;
+    /// @notice Shortest stretch of time a pool's pay is measured over.
+    uint64 public constant MIN_PAY_WINDOW = 12 hours;
+
+    /// @dev Two readings of a pool's reward counter (AERO paid per unit of staked liquidity, X128),
+    ///      so its pay can be measured over a real stretch of time even right after a new reading.
+    struct PayMark {
+        uint256 growth; // last reading
+        uint64 readAt;
+        uint256 prevGrowth; // the reading before it
+        uint64 prevReadAt;
+    }
+
+    mapping(address pool => PayMark) public payMark;
+    /// @dev Other pools of the same two tokens the owner allows this position to move into.
+    mapping(uint256 tokenId => address[]) internal alternates;
+
     event Deposited(uint256 indexed tokenId, address indexed owner, address gauge);
     event Withdrawn(uint256 indexed tokenId, address indexed owner);
     event Closed(
@@ -80,6 +98,9 @@ contract PositionGuard is AbstractCallback {
     event Watch(uint256 indexed tokenId, address indexed pool, int24 tickLower, int24 tickUpper, uint32 graceSeconds);
     /// @dev Read by the Reactive contract: stop watching.
     event Unwatch(uint256 indexed tokenId);
+    event AlternatesSet(uint256 indexed tokenId, address[] pools);
+    /// @notice A new reading of a pool's reward counter was taken.
+    event PayMarked(address indexed pool, uint256 growth);
 
     error NotOwner();
     error NotGuarded();
@@ -91,6 +112,8 @@ contract PositionGuard is AbstractCallback {
     error NotSwapPool();
     error BadLimit();
     error NoPriceHistory();
+    error TooManyAlternates();
+    error NotSamePair();
 
     /// @notice One swap of the payment token into one of the pool's tokens.
     struct SwapLeg {
@@ -202,6 +225,7 @@ contract PositionGuard is AbstractCallback {
         Guarded memory g = guarded[tokenId];
         if (g.owner != msg.sender) revert NotOwner();
         delete guarded[tokenId];
+        delete alternates[tokenId];
         _unlist(tokenId);
         _unstake(tokenId, g, g.owner);
         npm.transferFrom(address(this), g.owner, tokenId);
@@ -217,6 +241,22 @@ contract PositionGuard is AbstractCallback {
         if (maxLossBps >= 10_000) revert BadLimit();
         g.maxLossBps = maxLossBps;
         emit MaxLossSet(tokenId, maxLossBps);
+    }
+
+    /// @notice Name up to three other pools of the same two tokens (for example the same pair with a
+    ///         different price step) that this position may be moved into when they pay more.
+    ///         An empty list turns moving off.
+    function setAlternates(uint256 tokenId, address[] calldata pools) external {
+        Guarded storage g = guarded[tokenId];
+        if (g.owner != msg.sender) revert NotOwner();
+        if (pools.length > MAX_ALTERNATES) revert TooManyAlternates();
+        (address t0, address t1) = _poolTokens(g.pool);
+        for (uint256 i = 0; i < pools.length; i++) {
+            (address a0, address a1) = _poolTokens(pools[i]);
+            if (a0 != t0 || a1 != t1 || pools[i] == g.pool) revert NotSamePair();
+        }
+        alternates[tokenId] = pools;
+        emit AlternatesSet(tokenId, pools);
     }
 
     /// @notice Review one position now, without waiting for the daily run. Owner only.
@@ -310,6 +350,7 @@ contract PositionGuard is AbstractCallback {
     ///      or the guard itself when `closeTo` swaps them first). The empty NFT always goes to the owner.
     function _close(uint256 tokenId, Guarded memory g, address to) internal {
         delete guarded[tokenId];
+        delete alternates[tokenId];
         _unlist(tokenId);
 
         uint256 aeroPaid = _unstake(tokenId, g, to);
@@ -379,6 +420,29 @@ contract PositionGuard is AbstractCallback {
         return 0;
     }
 
+    /// @notice The other pools this position may be moved into.
+    function alternatesOf(uint256 tokenId) external view returns (address[] memory) {
+        return alternates[tokenId];
+    }
+
+    /// @notice How much AERO a pool has been paying, per second, to a staked position worth 1e18
+    ///         of the pool's token1 with a range of ± `halfWidth` ticks around the price. Measured
+    ///         from the pool's reward counter over at least MIN_PAY_WINDOW; zero until then.
+    ///         Comparable between pools of the same two tokens.
+    /// @dev The counter only grows while staked liquidity is in range, so this is what an in-range
+    ///      position would have earned. Valued at the pool's 30-minute average price.
+    function payRate(address pool, int24 halfWidth) public view returns (uint256) {
+        PayMark memory m = payMark[pool];
+        (uint256 base, uint64 since) = block.timestamp - m.readAt >= MIN_PAY_WINDOW ? (m.growth, m.readAt) : (m.prevGrowth, m.prevReadAt);
+        if (since == 0) return 0;
+        uint256 grown;
+        unchecked {
+            grown = _rewardGrowth(pool) - base; // the counter may wrap, like Uniswap's fee counters
+        }
+        uint256 perValue = grown.mulDiv(1e18, 2 ** 128).mulDiv(Q96, _valuePerLiquidity(pool, halfWidth));
+        return perValue / (block.timestamp - since);
+    }
+
     /// @notice Positions the daily review goes through.
     function reviewCount() external view returns (uint256) {
         return reviewList.length;
@@ -420,7 +484,50 @@ contract PositionGuard is AbstractCallback {
             }
         }
         emit Reviewed(tokenId, holdValue, positionValue, aeroValue, behind);
+        _markPays(tokenId, g.pool);
         if (behind) _close(tokenId, g, g.owner);
+    }
+
+    /// @dev Takes a new reading of the pool's reward counter, at most once per MIN_PAY_WINDOW, keeping
+    ///      the previous one so `payRate` always has a full window to measure over.
+    function _markPay(address pool) internal {
+        PayMark storage m = payMark[pool];
+        if (m.readAt != 0 && block.timestamp - m.readAt < MIN_PAY_WINDOW) return;
+        uint256 growth = _rewardGrowth(pool);
+        m.prevGrowth = m.growth;
+        m.prevReadAt = m.readAt;
+        m.growth = growth;
+        m.readAt = uint64(block.timestamp);
+        emit PayMarked(pool, growth);
+    }
+
+    /// @dev Reads the pool's reward counter for the current pool and its alternates.
+    function _markPays(uint256 tokenId, address pool) internal {
+        _markPay(pool);
+        address[] storage alts = alternates[tokenId];
+        for (uint256 i = 0; i < alts.length; i++) {
+            _markPay(alts[i]);
+        }
+    }
+
+    function _rewardGrowth(address pool) internal view returns (uint256) {
+        return ICLPool(pool).rewardGrowthGlobalX128();
+    }
+
+    /// @dev What one unit of liquidity is worth in token1, X96, for a range of ± `halfWidth` ticks
+    ///      (rounded to the pool's step, at least one step) around the 30-minute average price.
+    function _valuePerLiquidity(address pool, int24 halfWidth) internal view returns (uint256) {
+        int24 tick = _twapTick(pool);
+        int24 spacing = ICLPool(pool).tickSpacing();
+        int24 half = halfWidth / spacing;
+        if (half == 0) half = 1;
+        int24 base = tick / spacing;
+        if (tick < 0 && tick % spacing != 0) base -= 1;
+        uint256 sqrtP = sugar.getSqrtRatioAtTick(tick);
+        uint256 sqrtA = sugar.getSqrtRatioAtTick((base - half) * spacing);
+        uint256 sqrtB = sugar.getSqrtRatioAtTick((base + 1 + half) * spacing);
+        // token1 for the part above the price + token0 (in token1) for the part below it
+        return (sqrtP - sqrtA) + sqrtP.mulDiv(sqrtB - sqrtP, sqrtB);
     }
 
     /// @dev sqrt price at the pool's average tick over the last TWAP_WINDOW.
@@ -559,6 +666,7 @@ contract PositionGuard is AbstractCallback {
         g.gauge = gauge;
         g.pool = pool;
         _list(tokenId);
+        _markPay(pool);
         emit Deposited(tokenId, owner, gauge);
         if (graceSeconds > 0) _emitWatch(tokenId, pool, graceSeconds);
     }
