@@ -16,6 +16,7 @@ contract PositionGuardForkTest is Test {
     address constant OLD_AERO = 0x940181a94A35A4569E4529A3CDfB74e38FD98631; // pre-merger AERO, same symbol
     address constant WETH = 0x4200000000000000000000000000000000000006;
     address constant POOL = 0xc85D5CB72d1aaD6f152A8decAd228AE4A59Ac9B3; // AERO/WETH CL200
+    address constant SUGAR = 0x0AD09A66af0154a84e86F761313d02d0abB6edd5; // Aero SugarHelper
     int24 constant SPACING = 200;
 
     PositionGuard guard;
@@ -27,7 +28,7 @@ contract PositionGuardForkTest is Test {
 
     function setUp() public {
         vm.createSelectFork(vm.envOr("BASE_RPC_URL", string("https://base-rpc.publicnode.com")), 56_197_000);
-        guard = new PositionGuard(NPM, AERO, proxy, reactive);
+        guard = new PositionGuard(NPM, AERO, proxy, reactive, SUGAR);
 
         deal(AERO, user, 2_000e18);
         deal(WETH, user, 1e18);
@@ -142,7 +143,8 @@ contract PositionGuardForkTest is Test {
             amount0Min: 0,
             amount1Min: 0,
             stake: true,
-            graceSeconds: 3 hours
+            graceSeconds: 3 hours,
+            maxLossBps: 0
         });
     }
 
@@ -159,7 +161,7 @@ contract PositionGuardForkTest is Test {
     function test_open_mintsAroundPrice_stakes_refundsTheRest() public {
         uint256 id = _openAsUser();
 
-        (address owner, address gauge) = guard.guarded(id);
+        (address owner, address gauge,,,,,) = guard.guarded(id);
         assertEq(owner, user, "user owns the guarded position");
         assertEq(gauge, ICLPool(POOL).gauge(), "staked in the pool's gauge");
         assertEq(INonfungiblePositionManager(NPM).ownerOf(id), gauge, "NFT sits in the gauge");
@@ -263,7 +265,7 @@ contract PositionGuardForkTest is Test {
         uint256 id =
             guard.openWith(USDC, 200e6, _leg(USDC_AERO, 100e6, 1), _leg(WETH_USDC, 100e6, 1), _openParams(0, 0));
 
-        (address owner, address gauge) = guard.guarded(id);
+        (address owner, address gauge,,,,,) = guard.guarded(id);
         assertEq(owner, user);
         assertEq(INonfungiblePositionManager(NPM).ownerOf(id), gauge, "staked");
         (,,,,,,, uint128 liq,,,,) = INonfungiblePositionManager(NPM).positions(id);
@@ -352,7 +354,7 @@ contract PositionGuardForkTest is Test {
         assertEq(got, out, "reported amount matches");
         assertGt(got, 190e6, "round trip loses only swap fees");
         assertEq(INonfungiblePositionManager(NPM).ownerOf(id), user, "empty NFT returned");
-        (address owner,) = guard.guarded(id);
+        (address owner,,,,,,) = guard.guarded(id);
         assertEq(owner, address(0), "no longer guarded");
         assertEq(IERC20(USDC).balanceOf(address(guard)), 0, "guard keeps nothing");
         assertEq(IERC20(AERO).balanceOf(address(guard)), 0, "guard keeps nothing");
@@ -364,7 +366,7 @@ contract PositionGuardForkTest is Test {
         vm.prank(user);
         vm.expectRevert(PositionGuard.TooLittleReceived.selector);
         guard.closeTo(id, USDC, _leg(USDC_AERO, 0, 1_000_000e6), _leg(WETH_USDC, 0, 1));
-        (address owner,) = guard.guarded(id);
+        (address owner,,,,,,) = guard.guarded(id);
         assertEq(owner, user, "still guarded, nothing lost");
     }
 
@@ -384,6 +386,143 @@ contract PositionGuardForkTest is Test {
         assertGt(IERC20(WETH).balanceOf(user), wethBefore);
         assertEq(IERC20(AERO).balanceOf(address(guard)), 0);
         assertEq(IERC20(WETH).balanceOf(address(guard)), 0);
+    }
+
+    // ---- daily review: position against simply holding ----
+
+    uint256 constant PUSH = 400e18; // WETH sold into the pool to move the price
+
+    function _openWithLimit(uint16 maxLossBps) internal returns (uint256 id) {
+        deal(AERO, user, 1_000e18);
+        deal(WETH, user, 1e18);
+        PositionGuard.OpenParams memory p = _openParams(1_000e18, 1e18);
+        p.maxLossBps = maxLossBps;
+        vm.startPrank(user);
+        IERC20Approve(AERO).approve(address(guard), type(uint256).max);
+        IERC20Approve(WETH).approve(address(guard), type(uint256).max);
+        id = guard.open(p);
+        vm.stopPrank();
+    }
+
+    /// Someone sells a lot of WETH into the pool: AERO gets dearer, the position drifts from holding.
+    function _pushPrice(uint256 wethIn) internal {
+        (, int24 before) = _slot0();
+        Swapper s = new Swapper();
+        deal(WETH, address(s), wethIn);
+        s.swap(POOL, false, wethIn); // token1 (WETH) in
+        (, int24 afterTick) = _slot0();
+        console2.log("price pushed by ticks:", uint256(int256(afterTick - before)));
+    }
+
+    /// On a fork nobody runs the gauge's epoch distribution, so no new AERO accrues here; this
+    /// checks the bookkeeping: whatever the claim pays the owner is what the guard remembers.
+    function test_review_keepsAHealthyPosition_andRemembersAeroPaid() public {
+        uint256 id = _openWithLimit(500); // close only if 5% behind holding
+        vm.warp(block.timestamp + 1 days);
+
+        uint256 aeroBefore = IERC20(AERO).balanceOf(user);
+        vm.prank(user);
+        guard.review(id);
+        uint256 got = IERC20(AERO).balanceOf(user) - aeroBefore;
+        console2.log("AERO paid to owner by the review:", got);
+
+        (address owner,,,,,, uint256 aeroPaid) = guard.guarded(id);
+        assertEq(owner, user, "still guarded");
+        assertEq(aeroPaid, got, "AERO paid is remembered exactly");
+
+        (uint256 hold, uint256 pos,) = guard.standing(id);
+        console2.log("hold / position, in WETH wei:", hold, pos);
+        assertApproxEqRel(pos, hold, 0.001e18, "price did not move: position is worth what holding is");
+    }
+
+    function test_review_closesAPositionThatFellBehindHolding() public {
+        uint256 id = _openWithLimit(20); // 0.2%
+        _pushPrice(PUSH);
+        vm.warp(block.timestamp + 31 minutes); // the 30-minute average now sits at the new price
+
+        (uint256 hold, uint256 pos, uint256 aeroV) = guard.standing(id);
+        console2.log("after the move - hold / position / AERO:", hold, pos, aeroV);
+        assertLt(pos, hold, "the move left the position behind holding");
+
+        uint256 wethBefore = IERC20(WETH).balanceOf(user);
+        vm.prank(user);
+        guard.review(id);
+        (address owner,,,,,,) = guard.guarded(id);
+        assertEq(owner, address(0), "closed");
+        assertEq(INonfungiblePositionManager(NPM).ownerOf(id), user, "empty NFT back");
+        assertGt(IERC20(WETH).balanceOf(user), wethBefore, "tokens back to the owner");
+        assertEq(guard.reviewCount(), 0, "off the review list");
+    }
+
+    function test_review_withoutLimit_onlyReports() public {
+        uint256 id = _openWithLimit(0);
+        _pushPrice(PUSH);
+        vm.warp(block.timestamp + 31 minutes);
+        vm.prank(user);
+        guard.review(id);
+        (address owner,,,,,,) = guard.guarded(id);
+        assertEq(owner, user, "no limit set: the review never closes");
+    }
+
+    function test_reviewByReactive_goesThroughEveryPosition_andOnlyFromTheProxy() public {
+        uint256 a = _openWithLimit(20);
+        uint256 b = _openWithLimit(0);
+        assertEq(guard.reviewCount(), 2);
+        _pushPrice(PUSH);
+        vm.warp(block.timestamp + 31 minutes);
+
+        vm.prank(stranger);
+        vm.expectRevert();
+        guard.reviewByReactive(reactive);
+        vm.prank(proxy);
+        vm.expectRevert();
+        guard.reviewByReactive(stranger);
+
+        uint256 g0 = gasleft();
+        vm.prank(proxy);
+        guard.reviewByReactive(reactive);
+        console2.log("gas for a review of two positions (one closed):", g0 - gasleft());
+        (address ownerA,,,,,,) = guard.guarded(a);
+        (address ownerB,,,,,,) = guard.guarded(b);
+        assertEq(ownerA, address(0), "a had a limit and fell behind: closed");
+        assertEq(ownerB, user, "b has no limit: kept");
+        assertEq(guard.reviewCount(), 1);
+    }
+
+    function test_setMaxLoss_ownerOnly_andBounded() public {
+        uint256 id = _openWithLimit(0);
+        vm.prank(stranger);
+        vm.expectRevert(PositionGuard.NotOwner.selector);
+        guard.setMaxLoss(id, 100);
+        vm.prank(user);
+        vm.expectRevert(PositionGuard.BadLimit.selector);
+        guard.setMaxLoss(id, 10_000);
+        vm.prank(user);
+        guard.setMaxLoss(id, 100);
+        (,,, uint16 limit,,,) = guard.guarded(id);
+        assertEq(limit, 100);
+        vm.prank(stranger);
+        vm.expectRevert(PositionGuard.NotOwner.selector);
+        guard.review(id);
+    }
+}
+
+/// Swaps in a pool directly, paying in the callback.
+contract Swapper {
+    function swap(address pool, bool zeroForOne, uint256 amountIn) external {
+        ICLPool(pool)
+            .swap(
+                address(this),
+                zeroForOne,
+                int256(amountIn),
+                zeroForOne ? 4295128740 : 1461446703485210103287273052203988822378723970341,
+                ""
+            );
+    }
+
+    function uniswapV3SwapCallback(int256 a0, int256 a1, bytes calldata) external {
+        address token = a0 > 0 ? ICLPool(msg.sender).token0() : ICLPool(msg.sender).token1();
+        IERC20(token).transfer(msg.sender, uint256(a0 > 0 ? a0 : a1));
     }
 }
 
