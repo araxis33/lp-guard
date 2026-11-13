@@ -108,6 +108,21 @@ interface ICLPool {
             uint16 observationCardinalityNext,
             bool unlocked
         );
+    function observe(uint32[] calldata secondsAgos)
+        external
+        view
+        returns (int56[] memory tickCumulatives, uint160[] memory secondsPerLiquidityCumulativeX128s);
+}
+
+/// Aero's Slipstream SugarHelper on Base (0x0AD09A66af0154a84e86F761313d02d0abB6edd5):
+/// position maths done by Aero's own deployed code.
+interface ISugarHelper {
+    function principal(address positionManager, uint256 tokenId, uint160 sqrtRatioX96)
+        external
+        view
+        returns (uint256 amount0, uint256 amount1);
+    function fees(address positionManager, uint256 tokenId) external view returns (uint256 amount0, uint256 amount1);
+    function getSqrtRatioAtTick(int24 tick) external pure returns (uint160 sqrtRatioX96);
 }
 
 interface ICLGauge {

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.29;
 
-import {INonfungiblePositionManager, ICLFactory, ICLPool, ICLGauge, IERC20} from "./interfaces/IAero.sol";
+import {INonfungiblePositionManager, ICLFactory, ICLPool, ICLGauge, IERC20, ISugarHelper} from "./interfaces/IAero.sol";
+import {MulDiv} from "./lib/MulDiv.sol";
 import {AbstractCallback} from "@reactive/src/base/AbstractCallback.sol";
 import {IPayable} from "@reactive/src/interfaces/IPayable.sol";
 
@@ -9,22 +10,45 @@ import {IPayable} from "@reactive/src/interfaces/IPayable.sol";
 /// @notice Holds a user's Aero (Slipstream) liquidity position, keeps it staked so it earns AERO,
 ///         and can close it and send everything back to the user when told to.
 ///
+///         Once a day it also reviews every position against simply holding: it claims the AERO
+///         earned so far and sends it to the owner, then compares what the position is worth now,
+///         plus all the AERO it has paid, with what the tokens put in would be worth if they had
+///         just been held. If the position is behind by more than the owner's limit, it is closed
+///         and everything goes back to the owner. Prices are 30-minute pool averages, so a single
+///         trade cannot push a review into a close.
+///
 ///         Who can do what:
 ///         - the position's owner: open one in a single step (`open`) or hand in an existing one
-///           (`deposit`), take it back untouched, or close it at any time;
-///         - the Reactive contract (through the callback proxy): only close it. Everything from a
-///           close goes to the owner, so the worst it can do is close a position early. It can
-///           never take funds. Nobody else can do anything.
+///           (`deposit`), take it back untouched, close it, set its loss limit, review it now;
+///         - the Reactive contract (through the callback proxy): close it, or run the daily review.
+///           Everything from a close goes to the owner, so the worst it can do is close a position
+///           early. It can never take funds. Nobody else can do anything.
 contract PositionGuard is AbstractCallback {
+    using MulDiv for uint256;
+
     INonfungiblePositionManager public immutable npm;
     IERC20 public immutable aero;
+    ISugarHelper public immutable sugar;
+
+    /// @notice Length of the price average used by a review.
+    uint32 public constant TWAP_WINDOW = 30 minutes;
+    /// @notice Most positions one review call goes through, so it fits in one callback.
+    uint256 public constant MAX_REVIEW = 4;
+    uint256 internal constant Q96 = 2 ** 96;
 
     struct Guarded {
         address owner;
         address gauge; // zero when the position is held unstaked
+        address pool;
+        uint16 maxLossBps; // close when behind holding by more than this; 0 = never by review
+        uint128 entry0; // token0 that went into the position
+        uint128 entry1; // token1 that went into the position
+        uint256 aeroPaid; // AERO already sent to the owner by reviews
     }
 
     mapping(uint256 tokenId => Guarded) public guarded;
+    uint256[] internal reviewList;
+    mapping(uint256 tokenId => uint256) internal reviewSlot; // index + 1; 0 = not listed
 
     event Deposited(uint256 indexed tokenId, address indexed owner, address gauge);
     event Withdrawn(uint256 indexed tokenId, address indexed owner);
@@ -36,6 +60,12 @@ contract PositionGuard is AbstractCallback {
         uint256 amount1,
         uint256 aeroPaid
     );
+    /// @notice One review. All values are in the pool's token1 at the 30-minute average price.
+    /// @param holdValue what the tokens put in would be worth if simply held
+    /// @param positionValue what the position is worth now (its tokens plus unclaimed fees)
+    /// @param aeroValue the AERO paid to the owner so far (zero if AERO has no price in this pool)
+    event Reviewed(uint256 indexed tokenId, uint256 holdValue, uint256 positionValue, uint256 aeroValue, bool closed);
+    event MaxLossSet(uint256 indexed tokenId, uint16 maxLossBps);
     /// @dev Read by the Reactive contract: start watching this position.
     event Watch(uint256 indexed tokenId, address indexed pool, int24 tickLower, int24 tickUpper, uint32 graceSeconds);
     /// @dev Read by the Reactive contract: stop watching.
@@ -49,6 +79,8 @@ contract PositionGuard is AbstractCallback {
     error BadSwapPool();
     error TooLittleReceived();
     error NotSwapPool();
+    error BadLimit();
+    error NoPriceHistory();
 
     /// @notice One swap of the payment token into one of the pool's tokens.
     struct SwapLeg {
@@ -75,26 +107,33 @@ contract PositionGuard is AbstractCallback {
         uint256 amount1Min; // slippage guard: least token1 that must go in
         bool stake; // stake in the gauge to earn AERO
         uint32 graceSeconds; // automatic close after this long out of range; 0 = off
+        uint16 maxLossBps; // daily review closes when behind holding by more than this; 0 = off
     }
 
     /// @param callbackProxy_ Reactive's callback proxy on this chain.
-    /// @param reactive_ The Reactive contract allowed to ask for a close.
-    constructor(address npm_, address aero_, address callbackProxy_, address reactive_)
+    /// @param reactive_ The Reactive contract allowed to ask for a close or a review.
+    /// @param sugar_ Aero's SugarHelper, used to value positions.
+    constructor(address npm_, address aero_, address callbackProxy_, address reactive_, address sugar_)
         AbstractCallback(IPayable(payable(callbackProxy_)), reactive_)
     {
         npm = INonfungiblePositionManager(npm_);
         aero = IERC20(aero_);
+        sugar = ISugarHelper(sugar_);
     }
 
     // ---- owner ----
 
     /// @notice Hand a position to the guard. The caller must own it and have approved the guard.
+    ///         The review compares against what the position holds at this moment.
     /// @param stake true to stake it in the pool's gauge (earns AERO), false to hold it unstaked (earns fees).
     /// @param graceSeconds how long the price must stay outside the position's range before it is
     ///        closed automatically. Zero turns the automatic close off.
     /// @dev Any ETH sent along stays in the guard and pays for the Reactive callback.
     function deposit(uint256 tokenId, bool stake, uint32 graceSeconds) external payable {
         npm.transferFrom(msg.sender, address(this), tokenId);
+        (uint160 sqrtP,,,,,) = ICLPool(_poolOf(tokenId)).slot0();
+        (uint256 a0, uint256 a1) = sugar.principal(address(npm), tokenId, sqrtP);
+        _record(tokenId, 0, a0, a1);
         _guard(tokenId, msg.sender, stake, graceSeconds);
     }
 
@@ -153,10 +192,27 @@ contract PositionGuard is AbstractCallback {
         Guarded memory g = guarded[tokenId];
         if (g.owner != msg.sender) revert NotOwner();
         delete guarded[tokenId];
+        _unlist(tokenId);
         _unstake(tokenId, g, g.owner);
         npm.transferFrom(address(this), g.owner, tokenId);
         emit Withdrawn(tokenId, g.owner);
         emit Unwatch(tokenId);
+    }
+
+    /// @notice Set how far behind simply holding the position may fall before the daily review
+    ///         closes it, in basis points (100 = 1%). Zero: the review only reports, never closes.
+    function setMaxLoss(uint256 tokenId, uint16 maxLossBps) external {
+        Guarded storage g = guarded[tokenId];
+        if (g.owner != msg.sender) revert NotOwner();
+        if (maxLossBps >= 10_000) revert BadLimit();
+        g.maxLossBps = maxLossBps;
+        emit MaxLossSet(tokenId, maxLossBps);
+    }
+
+    /// @notice Review one position now, without waiting for the daily run. Owner only.
+    function review(uint256 tokenId) external {
+        if (guarded[tokenId].owner != msg.sender) revert NotOwner();
+        _review(tokenId);
     }
 
     // ---- owner, or the Reactive contract ----
@@ -215,10 +271,39 @@ contract PositionGuard is AbstractCallback {
         _close(tokenId, g, g.owner);
     }
 
+    /// @notice The daily review of every guarded position, asked for by the Reactive contract's
+    ///         timer. A position whose pool has no price history yet is skipped, not closed.
+    function reviewByReactive(address sender_) external onlyServiceProvider onlyCallbackSender(sender_) {
+        uint256 n = reviewList.length < MAX_REVIEW ? reviewList.length : MAX_REVIEW;
+        uint256[] memory ids = new uint256[](n);
+        for (uint256 i = 0; i < n; i++) {
+            ids[i] = reviewList[i];
+        }
+        for (uint256 i = 0; i < n; i++) {
+            try this.reviewOne(ids[i]) {} catch {}
+        }
+        // Next run starts where this one stopped: move the reviewed ones to the back.
+        if (reviewList.length > MAX_REVIEW) {
+            for (uint256 i = 0; i < n; i++) {
+                if (reviewSlot[ids[i]] != 0) {
+                    _unlist(ids[i]);
+                    _list(ids[i]);
+                }
+            }
+        }
+    }
+
+    /// @dev Called by the guard on itself so one failing position cannot stop the others.
+    function reviewOne(uint256 tokenId) external {
+        if (msg.sender != address(this)) revert NotOwner();
+        _review(tokenId);
+    }
+
     /// @dev Unstakes, removes all liquidity and sends the tokens, fees and AERO to `to` (the owner,
     ///      or the guard itself when `closeTo` swaps them first). The empty NFT always goes to the owner.
     function _close(uint256 tokenId, Guarded memory g, address to) internal {
         delete guarded[tokenId];
+        _unlist(tokenId);
 
         uint256 aeroPaid = _unstake(tokenId, g, to);
 
@@ -258,6 +343,40 @@ contract PositionGuard is AbstractCallback {
         return ICLGauge(g.gauge).earned(address(this), ids);
     }
 
+    /// @notice The review's numbers for a position right now, without acting on them.
+    ///         All in the pool's token1 at the 30-minute average price.
+    function standing(uint256 tokenId)
+        public
+        view
+        returns (uint256 holdValue, uint256 positionValue, uint256 aeroValue)
+    {
+        Guarded storage g = guarded[tokenId];
+        if (g.owner == address(0)) revert NotGuarded();
+        uint160 sqrtP = _twapSqrt(g.pool);
+        holdValue = _in1(g.entry0, sqrtP) + g.entry1;
+        positionValue = _positionValue(tokenId, sqrtP);
+        aeroValue = _aeroValue(g.pool, g.aeroPaid, sqrtP);
+    }
+
+    /// @dev The position's tokens plus its unclaimed fees, in token1.
+    function _positionValue(uint256 tokenId, uint160 sqrtP) internal view returns (uint256) {
+        (uint256 p0, uint256 p1) = sugar.principal(address(npm), tokenId, sqrtP);
+        (uint256 f0, uint256 f1) = sugar.fees(address(npm), tokenId);
+        return _in1(p0 + f0, sqrtP) + p1 + f1;
+    }
+
+    /// @dev AERO in token1, when AERO is one of the pool's tokens; otherwise it has no price here.
+    function _aeroValue(address pool, uint256 amount, uint160 sqrtP) internal view returns (uint256) {
+        if (ICLPool(pool).token0() == address(aero)) return _in1(amount, sqrtP);
+        if (ICLPool(pool).token1() == address(aero)) return amount;
+        return 0;
+    }
+
+    /// @notice Positions the daily review goes through.
+    function reviewCount() external view returns (uint256) {
+        return reviewList.length;
+    }
+
     /// @notice Called by a pool during `_swap` to be paid. Only the pool the guard is swapping in
     ///         right now gets anything, and only the amount it is owed.
     function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external {
@@ -268,6 +387,53 @@ contract PositionGuard is AbstractCallback {
     }
 
     // ---- internals ----
+
+    /// @dev Claims the AERO earned so far to the owner, then compares the position with holding
+    ///      and closes it if it is behind by more than the owner's limit.
+    function _review(uint256 tokenId) internal {
+        Guarded storage g = guarded[tokenId];
+        if (g.owner == address(0)) return;
+        if (g.gauge != address(0)) {
+            uint256 before = aero.balanceOf(g.owner);
+            uint256[] memory ids = new uint256[](1);
+            ids[0] = tokenId;
+            ICLGauge(g.gauge).claimEmissions(address(this), g.owner, ids);
+            g.aeroPaid += aero.balanceOf(g.owner) - before;
+        }
+        (uint256 holdValue, uint256 positionValue, uint256 aeroValue) = standing(tokenId);
+        bool behind =
+            g.maxLossBps > 0 && (positionValue + aeroValue) * 10_000 < holdValue * (10_000 - uint256(g.maxLossBps));
+        emit Reviewed(tokenId, holdValue, positionValue, aeroValue, behind);
+        if (behind) _close(tokenId, g, g.owner);
+    }
+
+    /// @dev sqrt price at the pool's average tick over the last TWAP_WINDOW.
+    function _twapSqrt(address pool) internal view returns (uint160) {
+        uint32[] memory ago = new uint32[](2);
+        ago[0] = TWAP_WINDOW;
+        (int56[] memory cum,) = _observe(pool, ago);
+        int56 delta = cum[1] - cum[0];
+        int24 tick = int24(delta / int56(uint56(TWAP_WINDOW)));
+        if (delta < 0 && delta % int56(uint56(TWAP_WINDOW)) != 0) tick--; // round towards -infinity
+        return sugar.getSqrtRatioAtTick(tick);
+    }
+
+    function _observe(address pool, uint32[] memory ago)
+        internal
+        view
+        returns (int56[] memory cum, uint160[] memory spl)
+    {
+        try ICLPool(pool).observe(ago) returns (int56[] memory c, uint160[] memory s) {
+            return (c, s);
+        } catch {
+            revert NoPriceHistory();
+        }
+    }
+
+    /// @dev `amount0` of token0 expressed in token1 at sqrt price `sqrtP`.
+    function _in1(uint256 amount0, uint160 sqrtP) internal pure returns (uint256) {
+        return amount0.mulDiv(sqrtP, Q96).mulDiv(sqrtP, Q96);
+    }
 
     /// @dev The pool's two tokens, after checking it is a real pool of the position manager's factory.
     function _poolTokens(address pool) internal view returns (address token0, address token1) {
@@ -284,29 +450,54 @@ contract PositionGuard is AbstractCallback {
         internal
         returns (uint256 tokenId)
     {
+        if (p.maxLossBps >= 10_000) revert BadLimit();
+        tokenId = _mintAndRecord(_mintParams(p, token0, token1, amount0, amount1), p.maxLossBps);
+        _guard(tokenId, msg.sender, p.stake, p.graceSeconds);
+    }
+
+    /// @dev Mints and records what went in and the loss limit; `_guard` does the rest.
+    function _mintAndRecord(INonfungiblePositionManager.MintParams memory m, uint16 maxLossBps)
+        internal
+        returns (uint256 tokenId)
+    {
+        uint256 used0;
+        uint256 used1;
+        (tokenId,, used0, used1) = npm.mint(m);
+        _record(tokenId, maxLossBps, used0, used1);
+    }
+
+    function _record(uint256 tokenId, uint16 maxLossBps, uint256 entry0, uint256 entry1) internal {
+        Guarded storage g = guarded[tokenId];
+        g.maxLossBps = maxLossBps;
+        g.entry0 = uint128(entry0);
+        g.entry1 = uint128(entry1);
+    }
+
+    /// @dev Mint parameters for a range of ± halfWidth tick spacings around the current price.
+    function _mintParams(OpenParams calldata p, address token0, address token1, uint256 amount0, uint256 amount1)
+        internal
+        view
+        returns (INonfungiblePositionManager.MintParams memory)
+    {
         int24 spacing = ICLPool(p.pool).tickSpacing();
         (, int24 tick,,,,) = ICLPool(p.pool).slot0();
         int24 base = tick / spacing;
         if (tick < 0 && tick % spacing != 0) base -= 1; // round down for negative ticks
         int24 half = int24(uint24(p.halfWidth));
-
-        (tokenId,,,) = npm.mint(
-            INonfungiblePositionManager.MintParams({
-                token0: token0,
-                token1: token1,
-                tickSpacing: spacing,
-                tickLower: (base - half) * spacing,
-                tickUpper: (base + 1 + half) * spacing,
-                amount0Desired: amount0,
-                amount1Desired: amount1,
-                amount0Min: p.amount0Min,
-                amount1Min: p.amount1Min,
-                recipient: address(this),
-                deadline: block.timestamp,
-                sqrtPriceX96: 0
-            })
-        );
-        _guard(tokenId, msg.sender, p.stake, p.graceSeconds);
+        return INonfungiblePositionManager.MintParams({
+            token0: token0,
+            token1: token1,
+            tickSpacing: spacing,
+            tickLower: (base - half) * spacing,
+            tickUpper: (base + 1 + half) * spacing,
+            amount0Desired: amount0,
+            amount1Desired: amount1,
+            amount0Min: p.amount0Min,
+            amount1Min: p.amount1Min,
+            recipient: address(this),
+            deadline: block.timestamp,
+            sqrtPriceX96: 0
+        });
     }
 
     /// @dev Swaps exactly `amountIn` of `tokenIn` (or less, if the pool runs out) for `tokenOut`
@@ -331,20 +522,49 @@ contract PositionGuard is AbstractCallback {
         if (IERC20(tokenOut).balanceOf(address(this)) - before < minOut) revert TooLittleReceived();
     }
 
-    /// @dev Records the owner, stakes if asked, and tells the Reactive contract what to watch.
+    /// @dev Records the owner (what went in is recorded before), stakes if asked, lists the position for the daily
+    ///      review, and tells the Reactive contract what to watch.
     function _guard(uint256 tokenId, address owner, bool stake, uint32 graceSeconds) internal {
-        (,, address token0, address token1, int24 tickSpacing, int24 tickLower, int24 tickUpper,,,,,) =
-            npm.positions(tokenId);
-        address pool = ICLFactory(npm.factory()).getPool(token0, token1, tickSpacing);
+        address pool = _poolOf(tokenId);
         address gauge;
         if (stake) {
             gauge = ICLPool(pool).gauge();
             npm.approve(gauge, tokenId);
             ICLGauge(gauge).deposit(tokenId);
         }
-        guarded[tokenId] = Guarded(owner, gauge);
+        Guarded storage g = guarded[tokenId];
+        g.owner = owner;
+        g.gauge = gauge;
+        g.pool = pool;
+        _list(tokenId);
         emit Deposited(tokenId, owner, gauge);
-        if (graceSeconds > 0) emit Watch(tokenId, pool, tickLower, tickUpper, graceSeconds);
+        if (graceSeconds > 0) _emitWatch(tokenId, pool, graceSeconds);
+    }
+
+    function _emitWatch(uint256 tokenId, address pool, uint32 graceSeconds) internal {
+        (,,,,, int24 tickLower, int24 tickUpper,,,,,) = npm.positions(tokenId);
+        emit Watch(tokenId, pool, tickLower, tickUpper, graceSeconds);
+    }
+
+    /// @dev The pool a position sits in.
+    function _poolOf(uint256 tokenId) internal view returns (address) {
+        (,, address token0, address token1, int24 tickSpacing,,,,,,,) = npm.positions(tokenId);
+        return ICLFactory(npm.factory()).getPool(token0, token1, tickSpacing);
+    }
+
+    function _list(uint256 tokenId) internal {
+        reviewList.push(tokenId);
+        reviewSlot[tokenId] = reviewList.length;
+    }
+
+    function _unlist(uint256 tokenId) internal {
+        uint256 slot = reviewSlot[tokenId];
+        if (slot == 0) return;
+        uint256 last = reviewList[reviewList.length - 1];
+        reviewList[slot - 1] = last;
+        reviewSlot[last] = slot;
+        reviewList.pop();
+        delete reviewSlot[tokenId];
     }
 
     /// @dev Takes `amount` of `token` from the caller and lets the position manager spend exactly that.
