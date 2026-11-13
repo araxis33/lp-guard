@@ -33,7 +33,14 @@ contract PositionGuard is AbstractCallback {
     /// @notice Length of the price average used by a review.
     uint32 public constant TWAP_WINDOW = 30 minutes;
     /// @notice Most positions one review call goes through, so it fits in one callback.
-    uint256 public constant MAX_REVIEW = 4;
+    uint256 public constant MAX_REVIEW = 3;
+    /// @notice Gas each position may use in the daily review, so one costly position (for example
+    ///         one holding a token that burns gas on transfer) cannot starve the others.
+    uint256 public constant GAS_PER_REVIEW = 1_000_000;
+    /// @notice A review closes only while the current price is within this many ticks (~1%) of the
+    ///         30-minute average; otherwise someone may be moving the price to profit from the
+    ///         close, and the close waits for the next review.
+    int24 public constant MAX_SPOT_DEVIATION = 100;
     uint256 internal constant Q96 = 2 ** 96;
 
     struct Guarded {
@@ -48,6 +55,7 @@ contract PositionGuard is AbstractCallback {
 
     mapping(uint256 tokenId => Guarded) public guarded;
     uint256[] internal reviewList;
+    uint256 internal reviewCursor; // where the next daily run starts
     mapping(uint256 tokenId => uint256) internal reviewSlot; // index + 1; 0 = not listed
 
     event Deposited(uint256 indexed tokenId, address indexed owner, address gauge);
@@ -66,6 +74,8 @@ contract PositionGuard is AbstractCallback {
     /// @param aeroValue the AERO paid to the owner so far (zero if AERO has no price in this pool)
     event Reviewed(uint256 indexed tokenId, uint256 holdValue, uint256 positionValue, uint256 aeroValue, bool closed);
     event MaxLossSet(uint256 indexed tokenId, uint16 maxLossBps);
+    /// @notice The review wanted to close, but the current price was too far from the average.
+    event CloseDeferred(uint256 indexed tokenId, int24 spotTick, int24 averageTick);
     /// @dev Read by the Reactive contract: start watching this position.
     event Watch(uint256 indexed tokenId, address indexed pool, int24 tickLower, int24 tickUpper, uint32 graceSeconds);
     /// @dev Read by the Reactive contract: stop watching.
@@ -274,22 +284,19 @@ contract PositionGuard is AbstractCallback {
     /// @notice The daily review of every guarded position, asked for by the Reactive contract's
     ///         timer. A position whose pool has no price history yet is skipped, not closed.
     function reviewByReactive(address sender_) external onlyServiceProvider onlyCallbackSender(sender_) {
-        uint256 n = reviewList.length < MAX_REVIEW ? reviewList.length : MAX_REVIEW;
+        uint256 len = reviewList.length;
+        if (len == 0) return;
+        uint256 n = len < MAX_REVIEW ? len : MAX_REVIEW;
+        uint256 start = reviewCursor % len;
         uint256[] memory ids = new uint256[](n);
         for (uint256 i = 0; i < n; i++) {
-            ids[i] = reviewList[i];
+            ids[i] = reviewList[(start + i) % len];
         }
+        // Next run starts where this one stops, so every position gets its turn.
+        reviewCursor = start + n;
         for (uint256 i = 0; i < n; i++) {
-            try this.reviewOne(ids[i]) {} catch {}
-        }
-        // Next run starts where this one stopped: move the reviewed ones to the back.
-        if (reviewList.length > MAX_REVIEW) {
-            for (uint256 i = 0; i < n; i++) {
-                if (reviewSlot[ids[i]] != 0) {
-                    _unlist(ids[i]);
-                    _list(ids[i]);
-                }
-            }
+            if (gasleft() < GAS_PER_REVIEW + 50_000) break;
+            try this.reviewOne{gas: GAS_PER_REVIEW}(ids[i]) {} catch {}
         }
     }
 
@@ -403,19 +410,34 @@ contract PositionGuard is AbstractCallback {
         (uint256 holdValue, uint256 positionValue, uint256 aeroValue) = standing(tokenId);
         bool behind =
             g.maxLossBps > 0 && (positionValue + aeroValue) * 10_000 < holdValue * (10_000 - uint256(g.maxLossBps));
+        if (behind) {
+            int24 avg = _twapTick(g.pool);
+            (, int24 spot,,,,) = ICLPool(g.pool).slot0();
+            int24 gap = spot > avg ? spot - avg : avg - spot;
+            if (gap > MAX_SPOT_DEVIATION) {
+                emit CloseDeferred(tokenId, spot, avg);
+                behind = false;
+            }
+        }
         emit Reviewed(tokenId, holdValue, positionValue, aeroValue, behind);
         if (behind) _close(tokenId, g, g.owner);
     }
 
     /// @dev sqrt price at the pool's average tick over the last TWAP_WINDOW.
+    ///      Both the position and holding are valued at this one price (the position at the amounts
+    ///      it would hold there), so a trade that moves the spot price changes neither number.
     function _twapSqrt(address pool) internal view returns (uint160) {
+        return sugar.getSqrtRatioAtTick(_twapTick(pool));
+    }
+
+    /// @dev The pool's average tick over the last TWAP_WINDOW, rounded towards -infinity.
+    function _twapTick(address pool) internal view returns (int24 tick) {
         uint32[] memory ago = new uint32[](2);
         ago[0] = TWAP_WINDOW;
         (int56[] memory cum,) = _observe(pool, ago);
         int56 delta = cum[1] - cum[0];
-        int24 tick = int24(delta / int56(uint56(TWAP_WINDOW)));
-        if (delta < 0 && delta % int56(uint56(TWAP_WINDOW)) != 0) tick--; // round towards -infinity
-        return sugar.getSqrtRatioAtTick(tick);
+        tick = int24(delta / int56(uint56(TWAP_WINDOW)));
+        if (delta < 0 && delta % int56(uint56(TWAP_WINDOW)) != 0) tick--;
     }
 
     function _observe(address pool, uint32[] memory ago)

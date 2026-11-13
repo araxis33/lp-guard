@@ -20,9 +20,9 @@ contract GuardReactive is AbstractReactive {
         uint256(keccak256("Swap(address,address,int256,int256,uint160,uint128,int24)"));
 
     uint64 public constant CALLBACK_GAS = 1_000_000;
-    /// @notice Gas for the daily review callback: it may claim, value and close up to four positions
+    /// @notice Gas for the daily review callback: it may claim, value and close up to three positions
     ///         (measured on a Base fork: two positions, one closed, ~1.13M).
-    uint64 public constant REVIEW_GAS = 3_000_000;
+    uint64 public constant REVIEW_GAS = 3_500_000;
     /// @notice Reactive Network's system contract that emits the Cron timer events.
     address public constant CRON = 0x0000000000000000000000000000000000fffFfF;
 
