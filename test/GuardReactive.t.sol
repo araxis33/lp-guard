@@ -182,4 +182,60 @@ contract GuardReactiveTest is Test {
         rx.react(l);
         assertEq(sys.reqCount(), 0);
     }
+
+    // ---- daily review timer ----
+
+    uint256 constant CRON_TOPIC = 0xb49937fb8970e19fd46d48f7e3fb00d659deac0347f79cd7cb542f0fc1503c70; // a Cron topic seen on mainnet
+    address constant CRON = 0x0000000000000000000000000000000000fffFfF;
+
+    function _tick(uint256 topic) internal {
+        IReactive.LogRecord memory l = _log(CRON, topic, 0, 0, "");
+        l.chainId = block.chainid; // Cron events come from the Reactive chain itself
+        vm.prank(SYSTEM);
+        rx.react(l);
+    }
+
+    function test_setReview_onlyDeployer_once_subscribesToCron() public {
+        vm.prank(makeAddr("someone"));
+        vm.expectRevert(GuardReactive.NotDeployer.selector);
+        rx.setReview(CRON_TOPIC, 1 days);
+        rx.setReview(CRON_TOPIC, 1 days);
+        assertEq(sys.subCount(), 3, "one more subscription: the timer");
+        (uint256 chainId, address c, uint256 topic0) = sys.subs(2);
+        assertEq(chainId, block.chainid);
+        assertEq(c, CRON);
+        assertEq(topic0, CRON_TOPIC);
+        vm.expectRevert(GuardReactive.ReviewAlreadySet.selector);
+        rx.setReview(CRON_TOPIC, 1 days);
+    }
+
+    function test_setReview_needsTheGuardFirst() public {
+        GuardReactive fresh = new GuardReactive(BASE);
+        vm.expectRevert(GuardReactive.GuardNotSet.selector);
+        fresh.setReview(CRON_TOPIC, 1 days);
+    }
+
+    function test_reviewAtMostOncePerInterval() public {
+        rx.setReview(CRON_TOPIC, 1 days);
+        _tick(CRON_TOPIC); // first tick: review
+        assertEq(sys.reqCount(), 1);
+        ISystemContract.CallbackConfiguration_V_1_0 memory r = sys.req(0);
+        assertEq(r.chainId, BASE);
+        assertEq(r.recipient, guard);
+        assertEq(r.payload, abi.encodeWithSignature("reviewByReactive(address)", address(0)));
+        _skip(12 hours);
+        _tick(CRON_TOPIC); // too early
+        assertEq(sys.reqCount(), 1);
+        _skip(12 hours);
+        _tick(CRON_TOPIC); // a day later
+        assertEq(sys.reqCount(), 2);
+    }
+
+    function test_timerIgnoresOtherTopicsAndIsOffUntilSet() public {
+        _tick(CRON_TOPIC); // review not switched on yet
+        assertEq(sys.reqCount(), 0);
+        rx.setReview(CRON_TOPIC, 1 days);
+        _tick(uint256(keccak256("some other cron")));
+        assertEq(sys.reqCount(), 0);
+    }
 }

@@ -20,6 +20,18 @@ contract GuardReactive is AbstractReactive {
         uint256(keccak256("Swap(address,address,int256,int256,uint160,uint128,int24)"));
 
     uint64 public constant CALLBACK_GAS = 1_000_000;
+    /// @notice Gas for the daily review callback: it may claim, value and close up to four positions
+    ///         (measured on a Base fork: two positions, one closed, ~1.13M).
+    uint64 public constant REVIEW_GAS = 3_000_000;
+    /// @notice Reactive Network's system contract that emits the Cron timer events.
+    address public constant CRON = 0x0000000000000000000000000000000000fffFfF;
+
+    /// @notice topic0 of the Cron event this contract wakes up on; 0 while the review is off.
+    uint256 public cronTopic;
+    /// @notice How often the review runs, in seconds.
+    uint32 public reviewEvery;
+    /// @notice When the last review was asked for.
+    uint64 public lastReview;
     /// @dev Upper bound on positions checked per swap, so one react() stays well under the gas cap.
     uint256 public constant MAX_PER_POOL = 40;
 
@@ -45,9 +57,12 @@ contract GuardReactive is AbstractReactive {
     event WentOut(uint256 indexed tokenId, int24 tick);
     event CameBack(uint256 indexed tokenId, int24 tick);
     event CloseRequested(uint256 indexed tokenId, int24 tick, uint64 outFor);
+    event ReviewRequested(uint64 at);
 
     error NotDeployer();
     error GuardAlreadySet();
+    error ReviewAlreadySet();
+    error GuardNotSet();
 
     constructor(uint256 originChainId_) payable {
         originChainId = originChainId_;
@@ -64,7 +79,24 @@ contract GuardReactive is AbstractReactive {
         SYSTEM.subscribe(originChainId, guard_, UNWATCH_TOPIC, REACTIVE_IGNORE, REACTIVE_IGNORE, REACTIVE_IGNORE);
     }
 
+    /// @notice One-time switch-on of the daily review: wake up on a Reactive Cron event and, at most
+    ///         once per `every_` seconds, ask the guard to review all positions.
+    /// @param cronTopic_ topic0 of the Cron event to wake up on (a slower one costs less: every
+    ///        tick is paid for).
+    function setReview(uint256 cronTopic_, uint32 every_) external {
+        if (msg.sender != deployer) revert NotDeployer();
+        if (guard == address(0)) revert GuardNotSet();
+        if (cronTopic != 0) revert ReviewAlreadySet();
+        cronTopic = cronTopic_;
+        reviewEvery = every_;
+        SYSTEM.subscribe(block.chainid, CRON, cronTopic_, REACTIVE_IGNORE, REACTIVE_IGNORE, REACTIVE_IGNORE);
+    }
+
     function react(LogRecord calldata log_) external onlySystem {
+        if (log_.contractAddress == CRON) {
+            if (cronTopic != 0 && log_.topic0 == cronTopic) _onTick();
+            return;
+        }
         if (log_.chainId != originChainId) return;
         if (log_.contractAddress == guard) {
             if (log_.topic0 == WATCH_TOPIC) _watch(log_);
@@ -79,6 +111,20 @@ contract GuardReactive is AbstractReactive {
     }
 
     // ---- internals ----
+
+    function _onTick() internal {
+        if (block.timestamp < uint256(lastReview) + reviewEvery) return;
+        lastReview = uint64(block.timestamp);
+        SYSTEM.requestCallbackV_1_0(
+            ISystemContract.CallbackConfiguration_V_1_0({
+                chainId: originChainId,
+                recipient: guard,
+                gasLimit: REVIEW_GAS,
+                payload: abi.encodeWithSignature("reviewByReactive(address)", address(0))
+            })
+        );
+        emit ReviewRequested(uint64(block.timestamp));
+    }
 
     function _watch(LogRecord calldata log_) internal {
         uint256 tokenId = log_.topic1;
