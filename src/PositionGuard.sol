@@ -73,6 +73,26 @@ contract PositionGuard is AbstractCallback {
     }
 
     mapping(address pool => PayMark) public payMark;
+
+    /// @notice How many price snapshots the guard keeps per pool, and the shortest gap between two.
+    ///         Pools only remember about an hour of prices, so the guard keeps its own day of them.
+    uint256 public constant SNAP_SLOTS = 24;
+    uint64 public constant SNAP_GAP = 1 hours;
+    /// @dev (ln 1.0001)^2 scaled by 1e18: one tick of price movement as a squared log return.
+    uint256 internal constant TICK_VAR_1E18 = 9_999_000_092;
+
+    struct Snap {
+        uint64 at;
+        int24 tick; // the pool's 30-minute average tick at `at`
+    }
+
+    struct SnapLog {
+        uint8 next; // slot the next snapshot goes into
+        uint8 count; // filled slots, up to SNAP_SLOTS
+        Snap[24] snaps;
+    }
+
+    mapping(address pool => SnapLog) internal snapLog;
     /// @dev Other pools of the same two tokens the owner allows this position to move into.
     mapping(uint256 tokenId => address[]) internal alternates;
 
@@ -101,6 +121,8 @@ contract PositionGuard is AbstractCallback {
     event AlternatesSet(uint256 indexed tokenId, address[] pools);
     /// @notice A new reading of a pool's reward counter was taken.
     event PayMarked(address indexed pool, uint256 growth);
+    /// @notice A new price snapshot of a pool was kept.
+    event Snapped(address indexed pool, int24 averageTick);
 
     error NotOwner();
     error NotGuarded();
@@ -443,6 +465,58 @@ contract PositionGuard is AbstractCallback {
         return perValue / (block.timestamp - since);
     }
 
+    /// @notice Keep a price snapshot of a pool (its 30-minute average), at most once per SNAP_GAP.
+    ///         Anyone may call it: the snapshot is an average the caller cannot set, and more
+    ///         snapshots only make `lossRate` measure over more points. Reviews call it too.
+    function snap(address pool) public {
+        _poolTokens(pool); // only real pools of the factory
+        _snap(pool);
+    }
+
+    /// @notice How much a staked position is expected to lose to price swings, per second, as a
+    ///         share of its value scaled by 1e18, for a range of ± `halfWidth` ticks around the price.
+    ///         This is the loss of providing liquidity against simply holding (loss-versus-rebalancing:
+    ///         variance / 4 x sqrt(price) x liquidity), with the variance measured from the guard's own
+    ///         snapshots. Zero until there are at least three snapshots.
+    /// @dev Same scale as `payRate` per 1e18 of value, so once AERO is priced in token1 the two can
+    ///      be compared directly: a pool is worth sitting in while it pays more than this.
+    function lossRate(address pool, int24 halfWidth) public view returns (uint256) {
+        uint256 variance = priceVariance(pool);
+        if (variance == 0) return 0;
+        uint256 sqrtP = sugar.getSqrtRatioAtTick(_twapTick(pool));
+        return (variance / 4).mulDiv(sqrtP, _valuePerLiquidity(pool, halfWidth));
+    }
+
+    /// @notice Variance of the pool's log price per second, scaled by 1e18, from the snapshots kept.
+    ///         Zero until there are at least three snapshots.
+    function priceVariance(address pool) public view returns (uint256) {
+        SnapLog storage l = snapLog[pool];
+        uint256 n = l.count;
+        if (n < 3) return 0;
+        uint256 first = (uint256(l.next) + SNAP_SLOTS - n) % SNAP_SLOTS;
+        uint256 sumSq;
+        Snap memory prev = l.snaps[first];
+        for (uint256 i = 1; i < n; i++) {
+            Snap memory cur = l.snaps[(first + i) % SNAP_SLOTS];
+            int256 d = int256(cur.tick) - int256(prev.tick);
+            sumSq += uint256(d * d);
+            prev = cur;
+        }
+        uint256 span = uint256(prev.at) - uint256(l.snaps[first].at);
+        return sumSq * TICK_VAR_1E18 / span;
+    }
+
+    /// @notice The snapshots kept for a pool, oldest first.
+    function snapsOf(address pool) external view returns (Snap[] memory out) {
+        SnapLog storage l = snapLog[pool];
+        uint256 n = l.count;
+        out = new Snap[](n);
+        uint256 first = (uint256(l.next) + SNAP_SLOTS - n) % SNAP_SLOTS;
+        for (uint256 i = 0; i < n; i++) {
+            out[i] = l.snaps[(first + i) % SNAP_SLOTS];
+        }
+    }
+
     /// @notice Positions the daily review goes through.
     function reviewCount() external view returns (uint256) {
         return reviewList.length;
@@ -484,8 +558,9 @@ contract PositionGuard is AbstractCallback {
             }
         }
         emit Reviewed(tokenId, holdValue, positionValue, aeroValue, behind);
-        _markPays(tokenId, g.pool);
+        // Readings are only needed for positions that stay; a close must fit in GAS_PER_REVIEW.
         if (behind) _close(tokenId, g, g.owner);
+        else _markPays(tokenId, g.pool);
     }
 
     /// @dev Takes a new reading of the pool's reward counter, at most once per MIN_PAY_WINDOW, keeping
@@ -501,13 +576,29 @@ contract PositionGuard is AbstractCallback {
         emit PayMarked(pool, growth);
     }
 
-    /// @dev Reads the pool's reward counter for the current pool and its alternates.
+    /// @dev Reads the reward counter and keeps a price snapshot for the current pool and its alternates.
     function _markPays(uint256 tokenId, address pool) internal {
         _markPay(pool);
+        _snap(pool);
         address[] storage alts = alternates[tokenId];
         for (uint256 i = 0; i < alts.length; i++) {
             _markPay(alts[i]);
+            _snap(alts[i]);
         }
+    }
+
+    /// @dev Keeps the pool's 30-minute average tick, at most once per SNAP_GAP, overwriting the oldest.
+    function _snap(address pool) internal {
+        SnapLog storage l = snapLog[pool];
+        if (l.count > 0) {
+            uint256 last = (uint256(l.next) + SNAP_SLOTS - 1) % SNAP_SLOTS;
+            if (block.timestamp - l.snaps[last].at < SNAP_GAP) return;
+        }
+        int24 tick = _twapTick(pool);
+        l.snaps[l.next] = Snap({at: uint64(block.timestamp), tick: tick});
+        l.next = uint8((uint256(l.next) + 1) % SNAP_SLOTS);
+        if (l.count < SNAP_SLOTS) l.count++;
+        emit Snapped(pool, tick);
     }
 
     function _rewardGrowth(address pool) internal view returns (uint256) {
