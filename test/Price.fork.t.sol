@@ -3,10 +3,19 @@ pragma solidity ^0.8.29;
 
 import {Test, console2} from "forge-std/Test.sol";
 import {PositionGuard} from "../src/PositionGuard.sol";
+import {stdStorage, StdStorage} from "forge-std/Test.sol";
+
+interface IERC20Approve {
+    function approve(address, uint256) external returns (bool);
+}
 
 /// Pricing AERO in a pool's token1, on a fork of Base: directly in an AERO pool, and through
 /// AERO/WETH for the WETH/USDC pool, which has no AERO in it.
 contract PriceForkTest is Test {
+    using stdStorage for StdStorage;
+    address constant WETH = 0x4200000000000000000000000000000000000006;
+    address constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
+    address user = makeAddr("user");
     address constant NPM = 0x4857DB576eE0e45F10525eC59527BfD10beeC60b;
     address constant AERO = 0x3f5bF3EdAc59d650D8fDf9657a71F2f904A3a4Ee;
     address constant SUGAR = 0x0AD09A66af0154a84e86F761313d02d0abB6edd5;
@@ -71,5 +80,43 @@ contract PriceForkTest is Test {
         require(ok, "sqrt");
         uint256 sqrtP = abi.decode(ret, (uint160));
         return uint256(1e18) * sqrtP / 2 ** 96 * sqrtP / 2 ** 96;
+    }
+
+    /// A WETH/USDC position that has been paid 100 AERO: the review sees their worth only once
+    /// the owner names a price pool (before, AERO in a pool without AERO counted as zero).
+    function test_standing_pricesAeroPaidThroughThePricePool() public {
+        uint256 id = _openWethUsdc();
+        uint256 slot = stdstore.target(address(guard)).sig("guarded(uint256)").with_key(id).depth(0).find();
+        vm.store(address(guard), bytes32(uint256(slot) + 4), bytes32(uint256(100e18))); // aeroPaid
+        (,, uint256 before) = guard.standing(id);
+        assertEq(before, 0);
+        vm.prank(user);
+        guard.setPricePool(id, AERO_WETH);
+        (,, uint256 aeroValue) = guard.standing(id);
+        console2.log("100 AERO paid, in USDC (6 dec):", aeroValue);
+        assertApproxEqRel(aeroValue, 100 * guard.aeroPrice(WETH_USDC, AERO_WETH), 0.0001e18);
+        assertGt(aeroValue, 20e6);
+    }
+
+    function _openWethUsdc() internal returns (uint256 id) {
+        deal(WETH, user, 1e18);
+        deal(USDC, user, 5_000e6);
+        vm.startPrank(user);
+        IERC20Approve(WETH).approve(address(guard), type(uint256).max);
+        IERC20Approve(USDC).approve(address(guard), type(uint256).max);
+        id = guard.open(
+            PositionGuard.OpenParams({
+                pool: WETH_USDC,
+                amount0: 1e18,
+                amount1: 5_000e6,
+                halfWidth: 5,
+                amount0Min: 0,
+                amount1Min: 0,
+                stake: true,
+                graceSeconds: 0,
+                maxLossBps: 0
+            })
+        );
+        vm.stopPrank();
     }
 }

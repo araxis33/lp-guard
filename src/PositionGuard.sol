@@ -443,6 +443,11 @@ contract PositionGuard is AbstractCallback {
         holdValue = _in1(g.entry0, sqrtP) + g.entry1;
         positionValue = _positionValue(tokenId, sqrtP);
         aeroValue = _aeroValue(g.pool, g.aeroPaid, sqrtP);
+        address via = pricePool[tokenId];
+        if (aeroValue == 0 && g.aeroPaid > 0 && via != address(0)) {
+            // the pool has no AERO in it: price the AERO paid through the owner's price pool
+            aeroValue = g.aeroPaid.mulDiv(aeroPrice(g.pool, via), 1e18);
+        }
     }
 
     /// @dev The position's tokens plus its unclaimed fees, in token1.
@@ -452,7 +457,8 @@ contract PositionGuard is AbstractCallback {
         return _in1(p0 + f0, sqrtP) + p1 + f1;
     }
 
-    /// @dev AERO in token1, when AERO is one of the pool's tokens; otherwise it has no price here.
+    /// @dev AERO in token1, when AERO is one of the pool's tokens; otherwise zero here and `standing`
+    ///      prices it through the owner's price pool, if one is set.
     function _aeroValue(address pool, uint256 amount, uint160 sqrtP) internal view returns (uint256) {
         if (ICLPool(pool).token0() == address(aero)) return _in1(amount, sqrtP);
         if (ICLPool(pool).token1() == address(aero)) return amount;
