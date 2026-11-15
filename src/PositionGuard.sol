@@ -95,8 +95,12 @@ contract PositionGuard is AbstractCallback {
     mapping(address pool => SnapLog) internal snapLog;
     /// @dev Other pools of the same two tokens the owner allows this position to move into.
     mapping(uint256 tokenId => address[]) internal alternates;
+    /// @notice For a pool without AERO in it: the pool the owner named to price AERO (AERO paired
+    ///         with one of the position's two tokens). Zero when not set.
+    mapping(uint256 tokenId => address) public pricePool;
 
     event Deposited(uint256 indexed tokenId, address indexed owner, address gauge);
+    event PricePoolSet(uint256 indexed tokenId, address pricePool);
     event Withdrawn(uint256 indexed tokenId, address indexed owner);
     event Closed(
         uint256 indexed tokenId,
@@ -136,6 +140,7 @@ contract PositionGuard is AbstractCallback {
     error NoPriceHistory();
     error TooManyAlternates();
     error NotSamePair();
+    error BadPricePool();
 
     /// @notice One swap of the payment token into one of the pool's tokens.
     struct SwapLeg {
@@ -279,6 +284,18 @@ contract PositionGuard is AbstractCallback {
         }
         alternates[tokenId] = pools;
         emit AlternatesSet(tokenId, pools);
+    }
+
+    /// @notice Name the pool that prices AERO for this position when its own pool has no AERO in it:
+    ///         a pool of AERO and one of the position's two tokens (for WETH/USDC, AERO/WETH or
+    ///         AERO/USDC). Owner only, so nobody can point the guard at a thin pool whose price is
+    ///         cheap to move. Zero turns it off.
+    function setPricePool(uint256 tokenId, address via) external {
+        Guarded storage g = guarded[tokenId];
+        if (g.owner != msg.sender) revert NotOwner();
+        if (via != address(0)) aeroPrice(g.pool, via); // reverts unless it prices AERO for this pool
+        pricePool[tokenId] = via;
+        emit PricePoolSet(tokenId, via);
     }
 
     /// @notice Review one position now, without waiting for the daily run. Owner only.
@@ -485,6 +502,39 @@ contract PositionGuard is AbstractCallback {
         if (variance == 0) return 0;
         uint256 sqrtP = sugar.getSqrtRatioAtTick(_twapTick(pool));
         return (variance / 4).mulDiv(sqrtP, _valuePerLiquidity(pool, halfWidth));
+    }
+
+    /// @notice What 1e18 of AERO is worth in `pool`'s token1 (raw units), at 30-minute average prices.
+    ///         Read from the pool itself when AERO is one of its tokens, otherwise through `via`: a
+    ///         pool of AERO and one of `pool`'s two tokens. Zero when there is no way to price it.
+    function aeroPrice(address pool, address via) public view returns (uint256) {
+        (address t0, address t1) = _poolTokens(pool);
+        if (t1 == address(aero)) return 1e18;
+        if (t0 == address(aero)) return _in1(1e18, _twapSqrt(pool));
+        if (via == address(0)) return 0;
+        (address v0, address v1) = _poolTokens(via);
+        uint160 sv = _twapSqrt(via);
+        address shared;
+        uint256 inShared; // 1e18 AERO in the shared token
+        if (v0 == address(aero)) {
+            (shared, inShared) = (v1, _in1(1e18, sv));
+        } else if (v1 == address(aero)) {
+            (shared, inShared) = (v0, uint256(1e18).mulDiv(Q96, sv).mulDiv(Q96, sv));
+        } else {
+            revert BadPricePool();
+        }
+        if (shared == t1) return inShared;
+        if (shared == t0) return _in1(inShared, _twapSqrt(pool));
+        revert BadPricePool();
+    }
+
+    /// @notice What a staked position in `pool` gains per second, as a share of its value scaled by
+    ///         1e18: the AERO it is paid (priced in token1) minus what it is expected to lose to price
+    ///         swings. Positive: sitting in the pool beats holding the two tokens. `via` prices AERO
+    ///         when the pool has none (see `aeroPrice`).
+    function netRate(address pool, int24 halfWidth, address via) public view returns (int256) {
+        uint256 pay = payRate(pool, halfWidth).mulDiv(aeroPrice(pool, via), 1e18);
+        return int256(pay) - int256(lossRate(pool, halfWidth));
     }
 
     /// @notice Variance of the pool's log price per second, scaled by 1e18, from the snapshots kept.
