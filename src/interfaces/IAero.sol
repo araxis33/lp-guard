@@ -92,6 +92,12 @@ interface ICLPool {
     function tickSpacing() external view returns (int24);
     /// AERO paid so far per unit of in-range staked liquidity, X128.
     function rewardGrowthGlobalX128() external view returns (uint256);
+    /// The pool brings rewardGrowthGlobalX128 up to date only when it is touched (swaps, liquidity
+    /// changes, the gauge); these let a reader add what has accrued since.
+    function rewardRate() external view returns (uint256);
+    function rewardReserve() external view returns (uint256);
+    function stakedLiquidity() external view returns (uint128);
+    function lastUpdated() external view returns (uint32);
     function swap(
         address recipient,
         bool zeroForOne,

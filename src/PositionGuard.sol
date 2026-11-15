@@ -42,6 +42,8 @@ contract PositionGuard is AbstractCallback {
     ///         close, and the close waits for the next review.
     int24 public constant MAX_SPOT_DEVIATION = 100;
     uint256 internal constant Q96 = 2 ** 96;
+    int24 internal constant MIN_TICK = -887272;
+    int24 internal constant MAX_TICK = 887272;
 
     struct Guarded {
         address owner;
@@ -484,7 +486,7 @@ contract PositionGuard is AbstractCallback {
         unchecked {
             grown = _rewardGrowth(pool) - base; // the counter may wrap, like Uniswap's fee counters
         }
-        uint256 perValue = grown.mulDiv(1e18, 2 ** 128).mulDiv(Q96, _valuePerLiquidity(pool, halfWidth));
+        uint256 perValue = grown.mulDiv(1e18, _valuePerLiquidity(pool, halfWidth)).mulDiv(Q96, 2 ** 128);
         return perValue / (block.timestamp - since);
     }
 
@@ -639,7 +641,8 @@ contract PositionGuard is AbstractCallback {
         address[] storage alts = alternates[tokenId];
         for (uint256 i = 0; i < alts.length; i++) {
             _markPay(alts[i]);
-            _snap(alts[i]);
+            // a pool too new to have 30 minutes of prices must not stop the review of this position
+            try this.snap(alts[i]) {} catch {}
         }
     }
 
@@ -657,8 +660,22 @@ contract PositionGuard is AbstractCallback {
         emit Snapped(pool, tick);
     }
 
-    function _rewardGrowth(address pool) internal view returns (uint256) {
-        return ICLPool(pool).rewardGrowthGlobalX128();
+    /// @dev The pool's reward counter as it would read if updated now. The pool itself only brings it
+    ///      up to date when touched, so a quiet pool would read as paying nothing and then, at its next
+    ///      swap, as having paid everything at once. Mirrors CLPool._updateRewardsGrowthGlobal.
+    function _rewardGrowth(address pool) internal view returns (uint256 growth) {
+        ICLPool p = ICLPool(pool);
+        growth = p.rewardGrowthGlobalX128();
+        uint256 elapsed = block.timestamp - p.lastUpdated();
+        uint256 staked = p.stakedLiquidity();
+        if (elapsed == 0 || staked == 0) return growth;
+        uint256 reserve = p.rewardReserve();
+        if (reserve == 0) return growth;
+        uint256 reward = p.rewardRate() * elapsed;
+        if (reward > reserve) reward = reserve;
+        unchecked {
+            growth += reward.mulDiv(2 ** 128, staked); // the counter may wrap, like the pool's
+        }
     }
 
     /// @dev What one unit of liquidity is worth in token1, X96, for a range of ± `halfWidth` ticks
@@ -671,8 +688,13 @@ contract PositionGuard is AbstractCallback {
         int24 base = tick / spacing;
         if (tick < 0 && tick % spacing != 0) base -= 1;
         uint256 sqrtP = sugar.getSqrtRatioAtTick(tick);
-        uint256 sqrtA = sugar.getSqrtRatioAtTick((base - half) * spacing);
-        uint256 sqrtB = sugar.getSqrtRatioAtTick((base + 1 + half) * spacing);
+        int24 lower = (base - half) * spacing;
+        int24 upper = (base + 1 + half) * spacing;
+        // near the ends of the price scale the range is cut at the last usable tick
+        if (lower < MIN_TICK) lower = -((-MIN_TICK) / spacing) * spacing;
+        if (upper > MAX_TICK) upper = (MAX_TICK / spacing) * spacing;
+        uint256 sqrtA = sugar.getSqrtRatioAtTick(lower);
+        uint256 sqrtB = sugar.getSqrtRatioAtTick(upper);
         // token1 for the part above the price + token0 (in token1) for the part below it
         return (sqrtP - sqrtA) + sqrtP.mulDiv(sqrtB - sqrtP, sqrtB);
     }
