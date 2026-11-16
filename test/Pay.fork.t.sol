@@ -3,7 +3,7 @@ pragma solidity ^0.8.29;
 
 import {Test, console2} from "forge-std/Test.sol";
 import {PositionGuard} from "../src/PositionGuard.sol";
-import {ICLPool, IERC20} from "../src/interfaces/IAero.sol";
+import {ICLPool, ICLGauge, ILeafVoter, IERC20} from "../src/interfaces/IAero.sol";
 
 interface IERC20Approve {
     function approve(address spender, uint256 amount) external returns (bool);
@@ -50,6 +50,15 @@ contract PayForkTest is Test {
             })
         );
         vm.stopPrank();
+    }
+
+    /// Pretends `pool` has nothing accrued since its last settlement (or `extra` AERO), so a test
+    /// controls what the guard reads instead of the fork's real emissions over a warp.
+    function _unsettled(address pool, uint256 extra) internal {
+        address gauge = ICLPool(pool).gauge();
+        address voter = ICLGauge(gauge).voter();
+        uint256 settled = ICLGauge(gauge).lastCumulativeRewardShare();
+        vm.mockCall(voter, abi.encodeCall(ILeafVoter.projectedCumulativeRewardShare, (gauge)), abi.encode(settled + extra));
     }
 
     function _alts(address a) internal pure returns (address[] memory pools) {
@@ -124,9 +133,13 @@ contract PayForkTest is Test {
         (, uint64 at50,,) = guard.payMark(CL50);
         assertGt(at50, 0);
 
-        uint256 g100 = ICLPool(CL100).rewardGrowthGlobalX128();
-        uint256 g50 = ICLPool(CL50).rewardGrowthGlobalX128();
+        // The guard's own readings (counter plus what had accrued unsettled at that moment).
+        (uint256 g100,,,) = guard.payMark(CL100);
+        (uint256 g50,,,) = guard.payMark(CL50);
         vm.warp(vm.getBlockTimestamp() + 1 days);
+        // Only the mocked counters move: no real emissions accrued over the warp.
+        _unsettled(CL100, 0);
+        _unsettled(CL50, 0);
         // Both pools paid the same per unit of liquidity...
         uint256 grown = 1e30;
         vm.mockCall(CL100, abi.encodeWithSignature("rewardGrowthGlobalX128()"), abi.encode(g100 + grown));
@@ -147,6 +160,101 @@ contract PayForkTest is Test {
         // Twice the counter growth in step 50: it pays twice as much.
         vm.mockCall(CL50, abi.encodeWithSignature("rewardGrowthGlobalX128()"), abi.encode(g50 + 2 * grown));
         assertApproxEqRel(guard.payRate(CL50, 500), 2 * r50, 0.01e18);
+    }
+
+    /// Codex 15.11 (1): a quiet pool's counter only moves when the pool is touched. The AERO accrued
+    /// since its last settlement counts too, exactly as if the counter had already moved.
+    function test_payRate_countsUnsettledAero_ofAQuietPool() public {
+        _open();
+        uint256 g = ICLPool(CL100).rewardGrowthGlobalX128();
+        uint256 staked = ICLPool(CL100).stakedLiquidity();
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        uint256 aero = 50e18;
+
+        // Untouched pool: counter frozen, 50 AERO waiting in the voter.
+        vm.mockCall(CL100, abi.encodeWithSignature("rewardGrowthGlobalX128()"), abi.encode(g));
+        _unsettled(CL100, aero);
+        uint256 quiet = guard.payRate(CL100, 500);
+        assertGt(quiet, 0);
+
+        // The same 50 AERO already settled into the counter: the same pay.
+        vm.mockCall(CL100, abi.encodeWithSignature("rewardGrowthGlobalX128()"), abi.encode(g + aero * 2 ** 128 / staked));
+        _unsettled(CL100, 0);
+        assertApproxEqRel(guard.payRate(CL100, 500), quiet, 0.001e18);
+    }
+
+    /// Codex 15.11 (2): an alternate pool too young for a 30-minute average (observe reverts "OLD")
+    /// must not undo the review of the position itself.
+    function test_review_alternateWithoutHistory_doesNotBlockTheReview() public {
+        uint256 id = _open();
+        vm.prank(user);
+        guard.setAlternates(id, _alts(CL50));
+        uint256 before = guard.snapsOf(CL100).length;
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        vm.mockCallRevert(CL50, abi.encodeWithSelector(ICLPool.observe.selector), "OLD");
+        vm.prank(user);
+        guard.review(id); // must not revert
+        assertEq(guard.snapsOf(CL100).length, before + 1); // the position's own pool was still read
+        assertEq(guard.snapsOf(CL50).length, 0); // the young alternate simply skipped
+    }
+
+    /// Codex 16.11: a mark taken with unsettled AERO, then a voter that can't be read, must not
+    /// read as a wrapped counter (an enormous pay); the next mark never moves back either.
+    function test_payRate_voterFailsAfterMark_noWrap() public {
+        // The position's own pool is settled by the review's claim; an alternate is only read, so its
+        // mark can include AERO still waiting unsettled.
+        uint256 id = _open();
+        vm.prank(user);
+        guard.setAlternates(id, _alts(CL50));
+        vm.warp(vm.getBlockTimestamp() + 13 hours);
+        uint256 frozen = ICLPool(CL50).rewardGrowthGlobalX128();
+        vm.mockCall(CL50, abi.encodeWithSignature("rewardGrowthGlobalX128()"), abi.encode(frozen));
+        vm.mockCall(CL50, abi.encodeWithSignature("lastUpdated()"), abi.encode(uint48(vm.getBlockTimestamp() - 1)));
+        _unsettled(CL50, 1_000e18);
+        vm.prank(user);
+        guard.review(id);
+        (uint256 g0, uint64 at0,,) = guard.payMark(CL50);
+        assertEq(at0, vm.getBlockTimestamp());
+        assertGt(g0, frozen); // the mark counted the waiting AERO
+        // The pool stays untouched and the voter stops answering.
+        address gauge = ICLPool(CL50).gauge();
+        vm.mockCallRevert(ICLGauge(gauge).voter(), abi.encodeCall(ILeafVoter.projectedCumulativeRewardShare, (gauge)), "down");
+        vm.warp(vm.getBlockTimestamp() + 13 hours);
+        vm.mockCall(CL50, abi.encodeWithSignature("lastUpdated()"), abi.encode(uint48(vm.getBlockTimestamp() - 1)));
+        assertEq(guard.payRate(CL50, 500), 0); // read as no pay measured, not as a wrap
+        vm.prank(user);
+        guard.review(id); // takes the next mark
+        (uint256 g1, uint64 at1,,) = guard.payMark(CL50);
+        assertEq(at1, vm.getBlockTimestamp());
+        assertEq(g1, g0); // never moved back
+    }
+
+    /// Codex 16.11 (4): a 30-minute average past the last usable tick of the step (887250 > 887200
+    /// for step 100) values the range as one token instead of underflowing.
+    function test_payRate_priceBeyondTheLastUsableTick_doesNotRevert() public {
+        _open();
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        int56[] memory cum = new int56[](2);
+        cum[0] = 0;
+        cum[1] = int56(887_250) * int56(uint56(guard.TWAP_WINDOW()));
+        uint160[] memory spl = new uint160[](2);
+        vm.mockCall(CL100, abi.encodeWithSelector(ICLPool.observe.selector), abi.encode(cum, spl));
+        uint256 g = ICLPool(CL100).rewardGrowthGlobalX128();
+        vm.mockCall(CL100, abi.encodeWithSignature("rewardGrowthGlobalX128()"), abi.encode(g + 1e30));
+        guard.payRate(CL100, 500); // must not revert
+        guard.payRate(CL100, 500_000);
+    }
+
+    /// If the voter can't be read, the counter is taken as it stands and the review still runs.
+    function test_payRate_voterReverts_fallsBackToTheCounter() public {
+        _open();
+        address gauge = ICLPool(CL100).gauge();
+        address voter = ICLGauge(gauge).voter();
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        vm.mockCallRevert(voter, abi.encodeCall(ILeafVoter.projectedCumulativeRewardShare, (gauge)), "down");
+        uint256 g = ICLPool(CL100).rewardGrowthGlobalX128();
+        vm.mockCall(CL100, abi.encodeWithSignature("rewardGrowthGlobalX128()"), abi.encode(g + 1e30));
+        assertGt(guard.payRate(CL100, 500), 0);
     }
 
     /// A reading is taken at most once per window, so many reviews in a row cannot shrink it.
