@@ -93,11 +93,10 @@ interface ICLPool {
     /// AERO paid so far per unit of in-range staked liquidity, X128.
     function rewardGrowthGlobalX128() external view returns (uint256);
     /// The pool brings rewardGrowthGlobalX128 up to date only when it is touched (swaps, liquidity
-    /// changes, the gauge); these let a reader add what has accrued since.
-    function rewardRate() external view returns (uint256);
-    function rewardReserve() external view returns (uint256);
+    /// changes, the gauge). What has accrued since is the gauge's unsettled reward share
+    /// (ILeafVoter.projectedCumulativeRewardShare − ICLGauge.lastCumulativeRewardShare).
     function stakedLiquidity() external view returns (uint128);
-    function lastUpdated() external view returns (uint32);
+    function lastUpdated() external view returns (uint48);
     function swap(
         address recipient,
         bool zeroForOne,
@@ -139,4 +138,15 @@ interface ICLGauge {
     function claimEmissions(address account, address recipient, uint256[] calldata tokenIds) external;
     function earned(address account, uint256[] calldata tokenIds) external view returns (uint256);
     function stakedContains(address depositor, uint256 tokenId) external view returns (bool);
+    /// The LeafVoter that settles this gauge's emissions.
+    function voter() external view returns (address);
+    /// Cumulative reward share the gauge has settled into its pool so far (AERO, 1e18).
+    function lastCumulativeRewardShare() external view returns (uint256);
+}
+
+/// Aero's LeafVoter (CLGauge.voter()): what each gauge has accrued, settled or not.
+interface ILeafVoter {
+    /// Cumulative reward share the gauge would settle to if settled now; minus the gauge's
+    /// lastCumulativeRewardShare it is the AERO accrued to the pool since its last settlement.
+    function projectedCumulativeRewardShare(address gauge) external view returns (uint256);
 }

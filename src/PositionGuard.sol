@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.29;
 
-import {INonfungiblePositionManager, ICLFactory, ICLPool, ICLGauge, IERC20, ISugarHelper} from "./interfaces/IAero.sol";
+import {INonfungiblePositionManager, ICLFactory, ICLPool, ICLGauge, ILeafVoter, IERC20, ISugarHelper} from "./interfaces/IAero.sol";
 import {MulDiv} from "./lib/MulDiv.sol";
 import {AbstractCallback} from "@reactive/src/base/AbstractCallback.sol";
 import {IPayable} from "@reactive/src/interfaces/IPayable.sol";
@@ -482,10 +482,11 @@ contract PositionGuard is AbstractCallback {
         PayMark memory m = payMark[pool];
         (uint256 base, uint64 since) = block.timestamp - m.readAt >= MIN_PAY_WINDOW ? (m.growth, m.readAt) : (m.prevGrowth, m.prevReadAt);
         if (since == 0) return 0;
-        uint256 grown;
-        unchecked {
-            grown = _rewardGrowth(pool) - base; // the counter may wrap, like Uniswap's fee counters
-        }
+        // A mark includes the AERO accrued but not yet settled at that moment; if the voter can't be
+        // read now, the counter alone can sit below it until the pool settles. Read that as no pay
+        // measured rather than as a wrap (Codex 16.11). Only views use this; closing goes by `standing`.
+        uint256 current = _rewardGrowth(pool);
+        uint256 grown = current > base ? current - base : 0;
         uint256 perValue = grown.mulDiv(1e18, _valuePerLiquidity(pool, halfWidth)).mulDiv(Q96, 2 ** 128);
         return perValue / (block.timestamp - since);
     }
@@ -627,6 +628,7 @@ contract PositionGuard is AbstractCallback {
         PayMark storage m = payMark[pool];
         if (m.readAt != 0 && block.timestamp - m.readAt < MIN_PAY_WINDOW) return;
         uint256 growth = _rewardGrowth(pool);
+        if (growth < m.growth) growth = m.growth; // a failed voter read never moves the mark back
         m.prevGrowth = m.growth;
         m.prevReadAt = m.readAt;
         m.growth = growth;
@@ -662,20 +664,28 @@ contract PositionGuard is AbstractCallback {
 
     /// @dev The pool's reward counter as it would read if updated now. The pool itself only brings it
     ///      up to date when touched, so a quiet pool would read as paying nothing and then, at its next
-    ///      swap, as having paid everything at once. Mirrors CLPool._updateRewardsGrowthGlobal.
+    ///      swap, as having paid everything at once. Mirrors CLPool._settleToBlock: the AERO accrued
+    ///      since the last settlement is the gauge's unsettled reward share, read from the LeafVoter
+    ///      (checked on Base 16.11.2026: ~3.9 AERO over 12 s on AERO/WETH CL200). If any of these
+    ///      reads fails, the counter is taken as it stands rather than failing the review.
     function _rewardGrowth(address pool) internal view returns (uint256 growth) {
         ICLPool p = ICLPool(pool);
         growth = p.rewardGrowthGlobalX128();
-        uint256 elapsed = block.timestamp - p.lastUpdated();
         uint256 staked = p.stakedLiquidity();
-        if (elapsed == 0 || staked == 0) return growth;
-        uint256 reserve = p.rewardReserve();
-        if (reserve == 0) return growth;
-        uint256 reward = p.rewardRate() * elapsed;
-        if (reward > reserve) reward = reserve;
-        unchecked {
-            growth += reward.mulDiv(2 ** 128, staked); // the counter may wrap, like the pool's
-        }
+        if (staked == 0 || p.lastUpdated() == block.timestamp) return growth;
+        address gauge = p.gauge();
+        if (gauge == address(0)) return growth;
+        try ICLGauge(gauge).voter() returns (address voter) {
+            try ILeafVoter(voter).projectedCumulativeRewardShare(gauge) returns (uint256 projected) {
+                try ICLGauge(gauge).lastCumulativeRewardShare() returns (uint256 settled) {
+                    if (projected > settled) {
+                        unchecked {
+                            growth += (projected - settled).mulDiv(2 ** 128, staked); // the counter may wrap, like the pool's
+                        }
+                    }
+                } catch {}
+            } catch {}
+        } catch {}
     }
 
     /// @dev What one unit of liquidity is worth in token1, X96, for a range of ± `halfWidth` ticks
@@ -695,8 +705,14 @@ contract PositionGuard is AbstractCallback {
         if (upper > MAX_TICK) upper = (MAX_TICK / spacing) * spacing;
         uint256 sqrtA = sugar.getSqrtRatioAtTick(lower);
         uint256 sqrtB = sugar.getSqrtRatioAtTick(upper);
-        // token1 for the part above the price + token0 (in token1) for the part below it
-        return (sqrtP - sqrtA) + sqrtP.mulDiv(sqrtB - sqrtP, sqrtB);
+        // After the cut the price can sit outside the range (e.g. tick 887250, step 200, top 887200):
+        // then the range holds one token only (Codex 16.11).
+        uint256 lo = sqrtP < sqrtA ? sqrtA : sqrtP; // max(price, lower end)
+        uint256 hi = sqrtP > sqrtB ? sqrtB : sqrtP; // min(price, upper end)
+        // token1 held below the price + token0 held above it, valued in token1 at the price
+        uint256 in1 = hi > sqrtA ? hi - sqrtA : 0;
+        uint256 in0 = lo < sqrtB ? sqrtP.mulDiv(sqrtP, lo).mulDiv(sqrtB - lo, sqrtB) : 0;
+        return in1 + in0;
     }
 
     /// @dev sqrt price at the pool's average tick over the last TWAP_WINDOW.
