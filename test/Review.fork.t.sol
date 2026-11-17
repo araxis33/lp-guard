@@ -166,7 +166,7 @@ contract ReviewForkTest is Test {
     }
 
     function test_reviewByReactive_everyPositionGetsItsTurn() public {
-        uint256 total = 6; // more than one run's worth (MAX_REVIEW = 3)
+        uint256 total = 4; // more than one run's worth (MAX_REVIEW = 2)
         for (uint256 i = 0; i < total; i++) {
             _openWithLimit(0);
         }
@@ -189,7 +189,7 @@ contract ReviewForkTest is Test {
             }
             if (!dup) ids[count++] = id;
         }
-        assertEq(count, total, "two daily runs reach all six positions");
+        assertEq(count, total, "two daily runs reach all four positions");
     }
 
     function test_setMaxLoss_ownerOnly_andBounded() public {
@@ -207,6 +207,131 @@ contract ReviewForkTest is Test {
         vm.prank(stranger);
         vm.expectRevert(PositionGuard.NotOwner.selector);
         guard.review(id);
+    }
+
+    // ---- exit when the pool no longer pays for its swings (netExitBps) ----
+
+    /// The price swings hard every hour for five hours (a snapshot after each swing), then the
+    /// pay window fills up: the guard has measured pay, swings and the AERO price.
+    function _swingForHours() internal {
+        Swapper s = new Swapper();
+        for (uint256 i = 0; i < 5; i++) {
+            if (i % 2 == 0) {
+                deal(WETH, address(s), PUSH);
+                s.swap(POOL, false, PUSH); // WETH in: AERO dearer
+            } else {
+                s.swap(POOL, true, IERC20(AERO).balanceOf(address(s))); // the AERO back: price returns
+            }
+            vm.warp(vm.getBlockTimestamp() + 61 minutes); // the 30-minute average follows
+            guard.snap(POOL);
+        }
+        vm.warp(vm.getBlockTimestamp() + 8 hours); // past the 12 h pay window since the open
+    }
+
+    function test_netExit_closesWhenSwingsCostMoreThanThePoolPays() public {
+        uint256 id = _openWithLimit(0); // no "behind holding" limit: only the net rule can close it
+        vm.prank(user);
+        guard.setNetExit(id, 1); // leave when it loses more than 0.01% a day net
+        _swingForHours();
+
+        (int256 net, bool measured) = guard.netPerDay(id);
+        console2.log("net per day, 1e18 = 100%:", net);
+        assertTrue(measured, "pay, swings and AERO price are all measured");
+        assertLt(net, 0, "hourly swings of hundreds of ticks cost more than the AERO paid");
+
+        uint256 wethBefore = IERC20(WETH).balanceOf(user);
+        vm.expectEmit(true, false, false, false, address(guard));
+        emit PositionGuard.NetExitDue(id, 0);
+        vm.prank(user);
+        guard.review(id);
+        (address owner,,,,,,) = guard.guarded(id);
+        assertEq(owner, address(0), "closed by the net rule");
+        assertGt(IERC20(WETH).balanceOf(user), wethBefore, "tokens back to the owner");
+        assertEq(guard.netExitBps(id), 0, "the rule is cleared with the position");
+    }
+
+    function test_netExit_fitsTheDailyRunByReactive() public {
+        uint256 id = _openWithLimit(0);
+        vm.prank(user);
+        guard.setNetExit(id, 1);
+        _swingForHours();
+        vm.prank(proxy);
+        guard.reviewByReactive(reactive); // each position gets GAS_PER_REVIEW; a failure would be swallowed
+        (address owner,,,,,,) = guard.guarded(id);
+        assertEq(owner, address(0), "the daily run closes it within its gas");
+    }
+
+    function test_netExit_deferredClose_saysNothing() public {
+        uint256 id = _openWithLimit(0);
+        vm.prank(user);
+        guard.setNetExit(id, 1);
+        _swingForHours();
+        _pushPrice(PUSH); // spot shoved away from the 30-minute average right before the review
+        vm.recordLogs();
+        vm.prank(user);
+        guard.review(id);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 due = keccak256("NetExitDue(uint256,int256)");
+        for (uint256 i = 0; i < logs.length; i++) {
+            assertTrue(logs[i].topics.length == 0 || logs[i].topics[0] != due, "no exit announced while it waits");
+        }
+        (address owner,,,,,,) = guard.guarded(id);
+        assertEq(owner, user, "the close waits for a calm price");
+    }
+
+    function test_netExit_unstakedPosition_isNeverMeasured_andReviewWorks() public {
+        deal(AERO, user, 1_000e18);
+        deal(WETH, user, 1e18);
+        PositionGuard.OpenParams memory p = _openParams(1_000e18, 1e18);
+        p.stake = false; // earns fees, not AERO
+        vm.startPrank(user);
+        IERC20Approve(AERO).approve(address(guard), type(uint256).max);
+        IERC20Approve(WETH).approve(address(guard), type(uint256).max);
+        uint256 id = guard.open(p);
+        guard.setNetExit(id, 1);
+        vm.stopPrank();
+        _swingForHours();
+        (, bool measured) = guard.netPerDay(id);
+        assertFalse(measured, "no AERO pay to weigh: not measured");
+        vm.prank(user);
+        guard.review(id);
+        (address owner,,,,,,) = guard.guarded(id);
+        assertEq(owner, user, "kept, and the review did not revert");
+    }
+
+    function test_netExit_off_keepsThePosition() public {
+        uint256 id = _openWithLimit(0);
+        _swingForHours();
+        vm.prank(user);
+        guard.review(id);
+        (address owner,,,,,,) = guard.guarded(id);
+        assertEq(owner, user, "rule off: the same swings do not close it");
+    }
+
+    function test_netExit_waitsUntilEverythingIsMeasured() public {
+        uint256 id = _openWithLimit(0);
+        vm.prank(user);
+        guard.setNetExit(id, 1);
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        (, bool measured) = guard.netPerDay(id);
+        assertFalse(measured, "no full pay window and no swings yet");
+        vm.prank(user);
+        guard.review(id);
+        (address owner,,,,,,) = guard.guarded(id);
+        assertEq(owner, user, "an unmeasured reading never closes");
+    }
+
+    function test_setNetExit_ownerOnly_andBounded() public {
+        uint256 id = _openWithLimit(0);
+        vm.prank(stranger);
+        vm.expectRevert(PositionGuard.NotOwner.selector);
+        guard.setNetExit(id, 10);
+        vm.prank(user);
+        vm.expectRevert(PositionGuard.BadLimit.selector);
+        guard.setNetExit(id, 10_000);
+        vm.prank(user);
+        guard.setNetExit(id, 10);
+        assertEq(guard.netExitBps(id), 10);
     }
 }
 

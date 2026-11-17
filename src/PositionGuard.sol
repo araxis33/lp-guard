@@ -33,10 +33,12 @@ contract PositionGuard is AbstractCallback {
     /// @notice Length of the price average used by a review.
     uint32 public constant TWAP_WINDOW = 30 minutes;
     /// @notice Most positions one review call goes through, so it fits in one callback.
-    uint256 public constant MAX_REVIEW = 3;
+    uint256 public constant MAX_REVIEW = 2;
     /// @notice Gas each position may use in the daily review, so one costly position (for example
-    ///         one holding a token that burns gas on transfer) cannot starve the others.
-    uint256 public constant GAS_PER_REVIEW = 1_000_000;
+    ///         one holding a token that burns gas on transfer) cannot starve the others. A close by
+    ///         the net rule measures pay, swings and the AERO price first: ~1.1M on Base (17.11),
+    ///         so 1.3M each, two per run, inside the Reactive contract's REVIEW_GAS of 3.5M.
+    uint256 public constant GAS_PER_REVIEW = 1_300_000;
     /// @notice A review closes only while the current price is within this many ticks (~1%) of the
     ///         30-minute average; otherwise someone may be moving the price to profit from the
     ///         close, and the close waits for the next review.
@@ -100,6 +102,13 @@ contract PositionGuard is AbstractCallback {
     /// @notice For a pool without AERO in it: the pool the owner named to price AERO (AERO paired
     ///         with one of the position's two tokens). Zero when not set.
     mapping(uint256 tokenId => address) public pricePool;
+    /// @notice Per position: the review closes it when the pool's pay minus its expected loss to
+    ///         price swings falls below minus this many basis points of its value a day. 0 = off.
+    mapping(uint256 tokenId => uint16) public netExitBps;
+    event NetExitSet(uint256 indexed tokenId, uint16 bpsPerDay);
+    /// @notice The review closed a position because its pool no longer pays for the swings.
+    ///         `netPerDay` is a share of the position's value a day, 1e18 = 100%.
+    event NetExitDue(uint256 indexed tokenId, int256 netPerDay);
 
     event Deposited(uint256 indexed tokenId, address indexed owner, address gauge);
     event PricePoolSet(uint256 indexed tokenId, address pricePool);
@@ -255,6 +264,7 @@ contract PositionGuard is AbstractCallback {
         if (g.owner != msg.sender) revert NotOwner();
         delete guarded[tokenId];
         delete alternates[tokenId];
+        delete netExitBps[tokenId];
         _unlist(tokenId);
         _unstake(tokenId, g, g.owner);
         npm.transferFrom(address(this), g.owner, tokenId);
@@ -298,6 +308,19 @@ contract PositionGuard is AbstractCallback {
         if (via != address(0)) aeroPrice(g.pool, via); // reverts unless it prices AERO for this pool
         pricePool[tokenId] = via;
         emit PricePoolSet(tokenId, via);
+    }
+
+    /// @notice Close at the review when sitting in the pool no longer pays: the AERO the pool pays
+    ///         (priced in token1) minus what the position is expected to lose to price swings
+    ///         (`netRate`) is below minus `bpsPerDay` basis points of its value a day. Owner only.
+    ///         Zero turns it off. Only staked positions earn AERO, so it only acts on those, and only
+    ///         once the pool's pay, price swings and AERO price have all been measured.
+    function setNetExit(uint256 tokenId, uint16 bpsPerDay) external {
+        Guarded storage g = guarded[tokenId];
+        if (g.owner != msg.sender) revert NotOwner();
+        if (bpsPerDay >= 10_000) revert BadLimit();
+        netExitBps[tokenId] = bpsPerDay;
+        emit NetExitSet(tokenId, bpsPerDay);
     }
 
     /// @notice Review one position now, without waiting for the daily run. Owner only.
@@ -392,6 +415,7 @@ contract PositionGuard is AbstractCallback {
     function _close(uint256 tokenId, Guarded memory g, address to) internal {
         delete guarded[tokenId];
         delete alternates[tokenId];
+        delete netExitBps[tokenId];
         _unlist(tokenId);
 
         uint256 aeroPaid = _unstake(tokenId, g, to);
@@ -546,6 +570,32 @@ contract PositionGuard is AbstractCallback {
         return int256(pay) - int256(lossRate(pool, halfWidth));
     }
 
+    /// @notice `netRate` for this position's own pool and range, per day (1e18 = 100% of its value),
+    ///         and whether all of it was measured: a staked position, a full pay window, at least
+    ///         three price snapshots, and a price for AERO. A reading that is not measured is never
+    ///         acted on, so a pool is not left just because the guard has not watched it long enough.
+    ///         Like `payRate`, it describes a position that sits in range: one out of range earns no
+    ///         AERO whatever this says, and leaving it is the job of the out-of-range close (graceSeconds).
+    function netPerDay(uint256 tokenId) public view returns (int256 net, bool measured) {
+        Guarded storage g = guarded[tokenId];
+        if (g.owner == address(0)) revert NotGuarded();
+        (,,,, int24 spacing, int24 lower, int24 upper,,,,,) = npm.positions(tokenId);
+        int24 half = (upper - lower) / 2;
+        address via = pricePool[tokenId];
+        PayMark memory m = payMark[g.pool];
+        uint64 since = block.timestamp - m.readAt >= MIN_PAY_WINDOW ? m.readAt : m.prevReadAt;
+        // a range one tick spacing wide has no half-width netRate can value: not measured
+        if (g.gauge == address(0) || since == 0 || half < spacing || priceVariance(g.pool) == 0) return (0, false);
+        // the price pool may lose its 30-minute history and revert: then this is simply not measured
+        try this.aeroPrice(g.pool, via) returns (uint256 price) {
+            if (price == 0) return (0, false);
+        } catch {
+            return (0, false);
+        }
+        measured = true;
+        net = netRate(g.pool, half, via) * 1 days;
+    }
+
     /// @notice Variance of the pool's log price per second, scaled by 1e18, from the snapshots kept.
     ///         Zero until there are at least three snapshots.
     function priceVariance(address pool) public view returns (uint256) {
@@ -607,6 +657,16 @@ contract PositionGuard is AbstractCallback {
         (uint256 holdValue, uint256 positionValue, uint256 aeroValue) = standing(tokenId);
         bool behind =
             g.maxLossBps > 0 && (positionValue + aeroValue) * 10_000 < holdValue * (10_000 - uint256(g.maxLossBps));
+        uint16 netLimit = netExitBps[tokenId];
+        bool netDue;
+        int256 net;
+        if (!behind && netLimit > 0 && g.gauge != address(0)) {
+            bool measured;
+            (net, measured) = netPerDay(tokenId);
+            // 1 basis point a day = 1e14 in the 1e18 share scale
+            netDue = measured && net < -int256(uint256(netLimit)) * 1e14;
+            behind = netDue;
+        }
         if (behind) {
             int24 avg = _twapTick(g.pool);
             (, int24 spot,,,,) = ICLPool(g.pool).slot0();
@@ -616,6 +676,7 @@ contract PositionGuard is AbstractCallback {
                 behind = false;
             }
         }
+        if (behind && netDue) emit NetExitDue(tokenId, net);
         emit Reviewed(tokenId, holdValue, positionValue, aeroValue, behind);
         // Readings are only needed for positions that stay; a close must fit in GAS_PER_REVIEW.
         if (behind) _close(tokenId, g, g.owner);
