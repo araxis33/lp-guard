@@ -10,7 +10,18 @@ the fees and the AERO. No bot, no server, no keys: the watching is done by a con
 
 Built for the Reactive Omni Buildathon, track "Set It and Forget It".
 
-**Status: prototype. Not audited. Not deployed on mainnet. Do not use with real funds.**
+**Status: live on Base and Reactive mainnet since 18 Nov 2026. Not audited. Use only small amounts.**
+
+Page: https://araxis33.github.io/lp-guard/
+
+## Mainnet deployment
+
+- `PositionGuard` (Base 8453): `0x249f0A7145Fa806F64DdeE142b7F8453152b2f15`
+- `PoolMath` library (Base 8453): `0xf20870781a64e36C8260d4FC4f390bd0AFaBdcba`
+- `GuardReactive` (Reactive 1597): `0x339c03A3De7d128C2b04ee54A90f5bD285fBc7e8`
+
+Deployed with `script/live.sh deploy`. The daily review runs on Reactive's Cron10000 timer,
+at most once a day per position.
 
 ## How it works
 
