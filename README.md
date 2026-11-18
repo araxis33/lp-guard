@@ -23,6 +23,18 @@ Page: https://araxis33.github.io/lp-guard/
 Deployed with `script/live.sh deploy`. The daily review runs on Reactive's Cron10000 timer,
 at most once a day per position.
 
+### Mainnet full loop (18 Nov 2026)
+
+Position #3562712, WETH/USDC CL50 on Aero, about $20 of USDC put in through the page.
+
+1. Origin event on Base: deposit, `Watch` emitted:
+   [`0xbb487a54…c489`](https://basescan.org/tx/0xbb487a54508995787231d053293c6509c33c28cc9dfa7a35267d9498149fc489)
+2. `GuardReactive` on Reactive picks up `Watch` and subscribes to the pool's swaps
+   (`watchedCount(pool) = 1`).
+3. Reactive's Cron10000 tick at 21:02:37 UTC triggers the daily review; the callback lands on Base:
+   [`0x3a5602ca…6a10`](https://basescan.org/tx/0x3a5602ca74498fc797e995a39b654a99b338987e65a419c1c784603e80456a10)
+   `Reviewed(3562712, hold $19.7524, position $19.7516, AERO $0.0102, behind=false)`.
+
 ## How it works
 
 ```
