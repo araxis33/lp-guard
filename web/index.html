@@ -75,7 +75,7 @@ a{color:var(--blue)}
   const q = new URLSearchParams(location.search);
   // The guard you approve USDC to is fixed here. Only a page opened from this computer
   // (localhost) may point at a local fork, so a crafted link cannot swap in another spender.
-  const LIVE_GUARD = "";
+  const LIVE_GUARD = "0x249f0A7145Fa806F64DdeE142b7F8453152b2f15";
   const LOCAL = location.hostname === "127.0.0.1" || location.hostname === "localhost";
   const CFG = {
     rpc: LOCAL && q.get("rpc") ? q.get("rpc") : "https://mainnet.base.org",
@@ -152,7 +152,12 @@ a{color:var(--blue)}
 
   async function onBase(p) {
     if ((await p.request({ method: "eth_chainId" })) !== CFG.chainHex) {
-      await p.request({ method: "wallet_switchEthereumChain", params: [{ chainId: CFG.chainHex }] });
+      try { await p.request({ method: "wallet_switchEthereumChain", params: [{ chainId: CFG.chainHex }] }); }
+      catch (e) {
+        if (e && e.code !== 4902) throw e; // 4902: the wallet does not know Base yet, add it
+        await p.request({ method: "wallet_addEthereumChain", params: [{ chainId: CFG.chainHex, chainName: "Base",
+          nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 }, rpcUrls: ["https://mainnet.base.org"], blockExplorerUrls: ["https://basescan.org"] }] });
+      }
       if ((await p.request({ method: "eth_chainId" })) !== CFG.chainHex) throw new Error("Switch the wallet to Base first.");
     }
   }
@@ -171,12 +176,15 @@ a{color:var(--blue)}
 
   async function send(data, to, what) {
     const p = provider();
-    await onBase(p);
     // Wallets estimate gas to the edge; the guard's try/catch reads then run out, so add 30%.
     let gas;
     try { gas = BigInt(await rpc("eth_estimateGas", [{ from: st.account, to, data }])); }
     catch (e) { throw new Error("This " + what + " would fail onchain: " + (e.message || "no reason given") + ". Nothing was sent."); }
     gas = gas * 13n / 10n;
+    // check chain and account right before sending: the wallet may have switched while we estimated
+    await onBase(p);
+    const now = (await p.request({ method: "eth_accounts" }))[0];
+    if (!now || now.toLowerCase() !== st.account.toLowerCase()) throw new Error("The wallet switched account. Reload the page.");
     const hash = await p.request({ method: "eth_sendTransaction", params: [{ from: st.account, to, data, gas: "0x" + gas.toString(16) }] });
     for (let i = 0; i < 90; i++) {
       const r = await rpc("eth_getTransactionReceipt", [hash]);
