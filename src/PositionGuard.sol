@@ -59,7 +59,7 @@ contract PositionGuard is AbstractCallback {
     }
 
     mapping(uint256 tokenId => Guarded) public guarded;
-    uint256[] internal reviewList;
+    uint256[] public reviewList;
     uint256 internal reviewCursor; // where the next daily run starts
     mapping(uint256 tokenId => uint256) internal reviewSlot; // index + 1; 0 = not listed
 
