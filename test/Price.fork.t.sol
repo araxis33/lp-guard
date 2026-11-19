@@ -3,6 +3,7 @@ pragma solidity ^0.8.29;
 
 import {Test, console2} from "forge-std/Test.sol";
 import {PositionGuard} from "../src/PositionGuard.sol";
+import {GuardMeter} from "../src/GuardMeter.sol";
 import {stdStorage, StdStorage} from "forge-std/Test.sol";
 
 interface IERC20Approve {
@@ -31,29 +32,30 @@ contract PriceForkTest is Test {
     }
 
     function test_aeroPrice_inAnAeroPool() public view {
-        uint256 inWeth = guard.aeroPrice(AERO_WETH, address(0));
+        uint256 inWeth = guard.meter().aeroPrice(AERO_WETH, address(0));
         console2.log("1 AERO in WETH wei:", inWeth);
         assertGt(inWeth, 0);
     }
 
     function test_aeroPrice_throughAnotherPool_matchesTheTwoPrices() public view {
-        uint256 inUsdc = guard.aeroPrice(WETH_USDC, AERO_WETH); // USDC has 6 decimals
+        uint256 inUsdc = guard.meter().aeroPrice(WETH_USDC, AERO_WETH); // USDC has 6 decimals
         console2.log("1 AERO in USDC (6 dec):", inUsdc);
         assertGt(inUsdc, 0.2e6);
         assertLt(inUsdc, 1.5e6);
         // the same as AERO -> WETH, then WETH -> USDC at the WETH/USDC pool's price
-        uint256 inWeth = guard.aeroPrice(AERO_WETH, address(0));
-        uint256 wethInUsdc = guard.aeroPrice(WETH_USDC, address(0)) == 0 ? _wethInUsdc() : 0;
+        uint256 inWeth = guard.meter().aeroPrice(AERO_WETH, address(0));
+        uint256 wethInUsdc = guard.meter().aeroPrice(WETH_USDC, address(0)) == 0 ? _wethInUsdc() : 0;
         assertApproxEqRel(inUsdc, inWeth * wethInUsdc / 1e18, 0.001e18);
     }
 
     function test_aeroPrice_zeroWithoutARoute() public view {
-        assertEq(guard.aeroPrice(WETH_USDC, address(0)), 0);
+        assertEq(guard.meter().aeroPrice(WETH_USDC, address(0)), 0);
     }
 
     function test_aeroPrice_rejectsAPoolWithoutAero() public {
+        GuardMeter m = guard.meter();
         vm.expectRevert(PositionGuard.BadPricePool.selector);
-        guard.aeroPrice(WETH_USDC, WETH_USDC_100);
+        m.aeroPrice(WETH_USDC, WETH_USDC_100);
     }
 
     function test_setPricePool_ownerOnly() public {
@@ -63,7 +65,7 @@ contract PriceForkTest is Test {
     }
 
     function test_netRate_zeroBeforeAnyReadings() public view {
-        assertEq(guard.netRate(WETH_USDC, 1000, AERO_WETH), 0);
+        assertEq(guard.meter().netRate(WETH_USDC, 1000, AERO_WETH), 0);
     }
 
     /// 1e18 WETH in USDC at the WETH/USDC pool's 30-minute average, read the same way the guard does.
@@ -94,7 +96,7 @@ contract PriceForkTest is Test {
         guard.setPricePool(id, AERO_WETH);
         (,, uint256 aeroValue) = guard.standing(id);
         console2.log("100 AERO paid, in USDC (6 dec):", aeroValue);
-        assertApproxEqRel(aeroValue, 100 * guard.aeroPrice(WETH_USDC, AERO_WETH), 0.0001e18);
+        assertApproxEqRel(aeroValue, 100 * guard.meter().aeroPrice(WETH_USDC, AERO_WETH), 0.0001e18);
         assertGt(aeroValue, 20e6);
     }
 

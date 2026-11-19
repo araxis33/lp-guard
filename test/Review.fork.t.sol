@@ -223,7 +223,7 @@ contract ReviewForkTest is Test {
                 s.swap(POOL, true, IERC20(AERO).balanceOf(address(s))); // the AERO back: price returns
             }
             vm.warp(vm.getBlockTimestamp() + 61 minutes); // the 30-minute average follows
-            guard.snap(POOL);
+            guard.meter().snap(POOL);
         }
         vm.warp(vm.getBlockTimestamp() + 8 hours); // past the 12 h pay window since the open
     }

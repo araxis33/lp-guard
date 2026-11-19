@@ -4,6 +4,7 @@ pragma solidity ^0.8.29;
 import {Test, console2} from "forge-std/Test.sol";
 import {PoolMath} from "../src/lib/PoolMath.sol";
 import {PositionGuard} from "../src/PositionGuard.sol";
+import {GuardMeter} from "../src/GuardMeter.sol";
 import {Swapper} from "./Review.fork.t.sol";
 
 /// Price snapshots and the expected loss to price swings, on a fork of Base: the real AERO/WETH pool.
@@ -49,50 +50,51 @@ contract LossForkTest is Test {
 
     /// Four hourly snapshots while the price is pushed up and down by `wethIn`.
     function _swingFourHours(uint256 wethIn) internal returns (uint256 loss) {
-        guard.snap(POOL);
+        guard.meter().snap(POOL);
         for (uint256 i = 0; i < 3; i++) {
             int24 before = _tick();
             if (i % 2 == 0) _swing(wethIn, 0);
             else _swing(0, wethIn * 1_000); // roughly the same value back in AERO
             console2.log("ticks moved:", int256(_tick()) - int256(before));
             _hourLater();
-            guard.snap(POOL);
+            guard.meter().snap(POOL);
         }
-        loss = guard.lossRate(POOL, 1000);
+        loss = guard.meter().lossRate(POOL, 1000);
     }
 
     function test_snap_keepsAtMostOnePerHour() public {
-        guard.snap(POOL);
-        guard.snap(POOL); // same hour: ignored
-        assertEq(guard.snapsOf(POOL).length, 1);
+        guard.meter().snap(POOL);
+        guard.meter().snap(POOL); // same hour: ignored
+        assertEq(guard.meter().snapsOf(POOL).length, 1);
         t += 30 minutes;
         vm.warp(t);
-        guard.snap(POOL);
-        assertEq(guard.snapsOf(POOL).length, 1);
+        guard.meter().snap(POOL);
+        assertEq(guard.meter().snapsOf(POOL).length, 1);
         _hourLater();
-        guard.snap(POOL);
-        assertEq(guard.snapsOf(POOL).length, 2);
+        guard.meter().snap(POOL);
+        assertEq(guard.meter().snapsOf(POOL).length, 2);
     }
 
     function test_snap_onlyRealPools() public {
+        GuardMeter m = guard.meter();
         vm.expectRevert();
-        guard.snap(makeAddr("notAPool"));
+        m.snap(makeAddr("notAPool"));
     }
 
     function test_lossRate_zeroUntilThreeSnapshots() public {
-        guard.snap(POOL);
+        guard.meter().snap(POOL);
         _hourLater();
-        guard.snap(POOL);
-        assertEq(guard.lossRate(POOL, 1000), 0);
-        assertEq(guard.priceVariance(POOL), 0);
+        guard.meter().snap(POOL);
+        assertEq(guard.meter().lossRate(POOL, 1000), 0);
+        assertEq(guard.meter().priceVariance(POOL), 0);
     }
 
     function test_snap_ringKeepsTheLast24() public {
         for (uint256 i = 0; i < 30; i++) {
-            guard.snap(POOL);
+            guard.meter().snap(POOL);
             _hourLater();
         }
-        PoolMath.Snap[] memory s = guard.snapsOf(POOL);
+        PoolMath.Snap[] memory s = guard.meter().snapsOf(POOL);
         assertEq(s.length, 24);
         for (uint256 i = 1; i < s.length; i++) {
             assertGt(s[i].at, s[i - 1].at); // oldest first, no gaps
@@ -111,6 +113,6 @@ contract LossForkTest is Test {
         assertGt(small, 0);
         assertGt(big, small * 4); // variance grows with the square of the move
         // A narrower range loses more of its value to the same swings.
-        assertGt(guard.lossRate(POOL, 400), big);
+        assertGt(guard.meter().lossRate(POOL, 400), big);
     }
 }

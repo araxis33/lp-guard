@@ -4,6 +4,7 @@ pragma solidity ^0.8.29;
 import {INonfungiblePositionManager, ICLFactory, ICLPool, ICLGauge, IERC20, ISugarHelper} from "./interfaces/IAero.sol";
 import {MulDiv} from "./lib/MulDiv.sol";
 import {PoolMath} from "./lib/PoolMath.sol";
+import {GuardMeter} from "./GuardMeter.sol";
 import {AbstractCallback} from "@reactive/src/base/AbstractCallback.sol";
 import {IPayable} from "@reactive/src/interfaces/IPayable.sol";
 
@@ -30,6 +31,8 @@ contract PositionGuard is AbstractCallback {
     INonfungiblePositionManager public immutable npm;
     IERC20 public immutable aero;
     ISugarHelper public immutable sugar;
+    /// @notice The guard's measurements of pools (pay, price swings), created with the guard.
+    GuardMeter public immutable meter;
 
     /// @notice Length of the price average used by a review.
     uint32 public constant TWAP_WINDOW = 30 minutes;
@@ -38,8 +41,9 @@ contract PositionGuard is AbstractCallback {
     /// @notice Gas each position may use in the daily review, so one costly position (for example
     ///         one holding a token that burns gas on transfer) cannot starve the others. A close by
     ///         the net rule measures pay, swings and the AERO price first: ~1.1M on Base (17.11),
-    ///         so 1.3M each, two per run, inside the Reactive contract's REVIEW_GAS of 3.5M.
-    uint256 public constant GAS_PER_REVIEW = 1_300_000;
+    ///         and a move into a better pool ~2.5M (19.11), so 2.8M each, two per run, inside the
+    ///         Reactive contract's REVIEW_GAS of 6M.
+    uint256 public constant GAS_PER_REVIEW = 2_800_000;
     /// @notice A review closes only while the current price is within this many ticks (~1%) of the
     ///         30-minute average; otherwise someone may be moving the price to profit from the
     ///         close, and the close waits for the next review.
@@ -65,10 +69,6 @@ contract PositionGuard is AbstractCallback {
 
     /// @notice Most other pools an owner may name for a position to move into.
     uint256 public constant MAX_ALTERNATES = 3;
-    /// @notice Readings of each pool's reward counter (see PoolMath.PayMark).
-    mapping(address pool => PoolMath.PayMark) public payMark;
-    /// @dev The guard's own day of price snapshots per pool: pools only remember about an hour.
-    mapping(address pool => PoolMath.SnapLog) internal snapLog;
     /// @dev Other pools of the same two tokens the owner allows this position to move into.
     mapping(uint256 tokenId => address[]) internal alternates;
     /// @notice For a pool without AERO in it: the pool the owner named to price AERO (AERO paired
@@ -92,6 +92,16 @@ contract PositionGuard is AbstractCallback {
     event WentOut(uint256 indexed tokenId, int24 averageTick);
     /// @notice The price came back into the range before the grace period ran out.
     event CameBack(uint256 indexed tokenId, int24 averageTick);
+    /// @notice How much more an alternate pool must earn than the current one, net of swings, before
+    ///         the position moves: 5 basis points of its value a day (1e18 = 100%, per second).
+    uint256 public constant MOVE_MARGIN = uint256(5e14) / 1 days;
+    /// @dev Per position: the alternate pool the last review found better. A move happens only when
+    ///      two reviews in a row (two days) point at the same pool.
+    mapping(uint256 tokenId => address) public moveVote;
+    /// @notice The review moved a position into a pool that earns more. Coins that did not fit the
+    ///         new range at the moment of the move went straight to the owner.
+    event Moved(uint256 indexed fromTokenId, uint256 indexed toTokenId, address indexed pool);
+
     /// @notice A position's hourly check reverted or ran out of its gas; it is tried again next hour.
     event CheckFailed(uint256 indexed tokenId);
     /// @dev Gas for each alternate pool's snapshot in the hourly check.
@@ -124,10 +134,6 @@ contract PositionGuard is AbstractCallback {
     event MaxLossSet(uint256 indexed tokenId, uint16 maxLossBps);
     /// @notice The review wanted to close, but the current price was too far from the average.
     event CloseDeferred(uint256 indexed tokenId, int24 spotTick, int24 averageTick);
-    /// @dev Read by the Reactive contract: start watching this position.
-    event Watch(uint256 indexed tokenId, address indexed pool, int24 tickLower, int24 tickUpper, uint32 graceSeconds);
-    /// @dev Read by the Reactive contract: stop watching.
-    event Unwatch(uint256 indexed tokenId);
     event AlternatesSet(uint256 indexed tokenId, address[] pools);
 
     error NotOwner();
@@ -181,6 +187,7 @@ contract PositionGuard is AbstractCallback {
         npm = INonfungiblePositionManager(npm_);
         aero = IERC20(aero_);
         sugar = ISugarHelper(sugar_);
+        meter = new GuardMeter(INonfungiblePositionManager(npm_).factory(), aero_, sugar_);
     }
 
     // ---- owner ----
@@ -258,11 +265,11 @@ contract PositionGuard is AbstractCallback {
         delete netExitBps[tokenId];
         delete rangeWatch[tokenId];
         delete pricePool[tokenId];
+        delete moveVote[tokenId];
         _unlist(tokenId);
         _unstake(tokenId, g, g.owner);
         npm.transferFrom(address(this), g.owner, tokenId);
         emit Withdrawn(tokenId, g.owner);
-        emit Unwatch(tokenId);
     }
 
     /// @notice Set how far behind simply holding the position may fall before the daily review
@@ -298,7 +305,7 @@ contract PositionGuard is AbstractCallback {
     function setPricePool(uint256 tokenId, address via) external {
         Guarded storage g = guarded[tokenId];
         if (g.owner != msg.sender) revert NotOwner();
-        if (via != address(0)) aeroPrice(g.pool, via); // reverts unless it prices AERO for this pool
+        if (via != address(0)) meter.aeroPrice(g.pool, via); // reverts unless it prices AERO for this pool
         pricePool[tokenId] = via;
         emit PricePoolSet(tokenId, via);
     }
@@ -425,7 +432,7 @@ contract PositionGuard is AbstractCallback {
         if (_rangeStep(tokenId, g)) return; // closed
         address[] storage alts = alternates[tokenId];
         for (uint256 i = 0; i < alts.length; i++) {
-            try this.snap{gas: SNAP_GAS}(alts[i]) {} catch {}
+            try meter.snap{gas: SNAP_GAS}(alts[i]) {} catch {}
         }
     }
 
@@ -467,6 +474,7 @@ contract PositionGuard is AbstractCallback {
         delete netExitBps[tokenId];
         delete rangeWatch[tokenId];
         delete pricePool[tokenId];
+        delete moveVote[tokenId];
         _unlist(tokenId);
 
         uint256 aeroPaid = _unstake(tokenId, g, to);
@@ -486,17 +494,10 @@ contract PositionGuard is AbstractCallback {
         );
         npm.transferFrom(address(this), g.owner, tokenId);
         emit Closed(tokenId, g.owner, msg.sender, amount0, amount1, aeroPaid);
-        emit Unwatch(tokenId);
     }
 
     // ---- views ----
 
-    /// @notice The gauge of the pool this position sits in.
-    function gaugeOf(uint256 tokenId) public view returns (address) {
-        (,, address token0, address token1, int24 tickSpacing,,,,,,,) = npm.positions(tokenId);
-        address pool = ICLFactory(npm.factory()).getPool(token0, token1, tickSpacing);
-        return ICLPool(pool).gauge();
-    }
 
     /// @notice AERO the position has earned in the gauge and not yet claimed.
     function pendingAero(uint256 tokenId) external view returns (uint256) {
@@ -523,7 +524,7 @@ contract PositionGuard is AbstractCallback {
         address via = pricePool[tokenId];
         if (aeroValue == 0 && g.aeroPaid > 0 && via != address(0)) {
             // the pool has no AERO in it: price the AERO paid through the owner's price pool
-            aeroValue = g.aeroPaid.mulDiv(aeroPrice(g.pool, via), 1e18);
+            aeroValue = g.aeroPaid.mulDiv(meter.aeroPrice(g.pool, via), 1e18);
         }
     }
 
@@ -547,53 +548,6 @@ contract PositionGuard is AbstractCallback {
         return alternates[tokenId];
     }
 
-    /// @notice How much AERO a pool has been paying, per second, to a staked position worth 1e18
-    ///         of the pool's token1 with a range of ± `halfWidth` ticks around the price. Measured
-    ///         from the pool's reward counter over at least MIN_PAY_WINDOW; zero until then.
-    ///         Comparable between pools of the same two tokens.
-    /// @dev The counter only grows while staked liquidity is in range, so this is what an in-range
-    ///      position would have earned. Valued at the pool's 30-minute average price.
-    function payRate(address pool, int24 halfWidth) public view returns (uint256) {
-        return PoolMath.payRate(payMark[pool], pool, halfWidth, sugar);
-    }
-
-    /// @notice Keep a price snapshot of a pool (its 30-minute average), at most once per SNAP_GAP.
-    ///         Anyone may call it: the snapshot is an average the caller cannot set, and more
-    ///         snapshots only make `lossRate` measure over more points. Reviews call it too.
-    function snap(address pool) public {
-        _poolTokens(pool); // only real pools of the factory
-        _snap(pool);
-    }
-
-    /// @notice How much a staked position is expected to lose to price swings, per second, as a
-    ///         share of its value scaled by 1e18, for a range of ± `halfWidth` ticks around the price.
-    ///         This is the loss of providing liquidity against simply holding (loss-versus-rebalancing:
-    ///         variance / 4 x sqrt(price) x liquidity), with the variance measured from the guard's own
-    ///         snapshots. Zero until there are at least three snapshots.
-    /// @dev Same scale as `payRate` per 1e18 of value, so once AERO is priced in token1 the two can
-    ///      be compared directly: a pool is worth sitting in while it pays more than this.
-    function lossRate(address pool, int24 halfWidth) public view returns (uint256) {
-        return PoolMath.lossRate(snapLog[pool], pool, halfWidth, sugar);
-    }
-
-    /// @notice What 1e18 of AERO is worth in `pool`'s token1 (raw units), at 30-minute average prices.
-    ///         Read from the pool itself when AERO is one of its tokens, otherwise through `via`: a
-    ///         pool of AERO and one of `pool`'s two tokens. Zero when there is no way to price it.
-    function aeroPrice(address pool, address via) public view returns (uint256) {
-        (address t0, address t1) = _poolTokens(pool);
-        if (via != address(0) && t0 != address(aero) && t1 != address(aero)) _poolTokens(via);
-        return PoolMath.aeroPrice(pool, via, address(aero), sugar);
-    }
-
-    /// @notice What a staked position in `pool` gains per second, as a share of its value scaled by
-    ///         1e18: the AERO it is paid (priced in token1) minus what it is expected to lose to price
-    ///         swings. Positive: sitting in the pool beats holding the two tokens. `via` prices AERO
-    ///         when the pool has none (see `aeroPrice`).
-    function netRate(address pool, int24 halfWidth, address via) public view returns (int256) {
-        uint256 pay = payRate(pool, halfWidth).mulDiv(aeroPrice(pool, via), 1e18);
-        return int256(pay) - int256(lossRate(pool, halfWidth));
-    }
-
     /// @notice `netRate` for this position's own pool and range, per day (1e18 = 100% of its value),
     ///         and whether all of it was measured: a staked position, a full pay window, at least
     ///         three price snapshots, and a price for AERO. A reading that is not measured is never
@@ -603,31 +557,9 @@ contract PositionGuard is AbstractCallback {
     function netPerDay(uint256 tokenId) public view returns (int256 net, bool measured) {
         Guarded storage g = guarded[tokenId];
         if (g.owner == address(0)) revert NotGuarded();
+        if (g.gauge == address(0)) return (0, false);
         (,,,, int24 spacing, int24 lower, int24 upper,,,,,) = npm.positions(tokenId);
-        int24 half = (upper - lower) / 2;
-        address via = pricePool[tokenId];
-        uint64 since = PoolMath.paySince(payMark[g.pool]);
-        // a range one tick spacing wide has no half-width netRate can value: not measured
-        if (g.gauge == address(0) || since == 0 || half < spacing || priceVariance(g.pool) == 0) return (0, false);
-        // the price pool may lose its 30-minute history and revert: then this is simply not measured
-        try this.aeroPrice(g.pool, via) returns (uint256 price) {
-            if (price == 0) return (0, false);
-        } catch {
-            return (0, false);
-        }
-        measured = true;
-        net = netRate(g.pool, half, via) * 1 days;
-    }
-
-    /// @notice Variance of the pool's log price per second, scaled by 1e18, from the snapshots kept.
-    ///         Zero until there are at least three snapshots.
-    function priceVariance(address pool) public view returns (uint256) {
-        return PoolMath.priceVariance(snapLog[pool]);
-    }
-
-    /// @notice The snapshots kept for a pool, oldest first.
-    function snapsOf(address pool) external view returns (PoolMath.Snap[] memory) {
-        return PoolMath.snapsOf(snapLog[pool]);
+        return meter.netPerDay(g.pool, (upper - lower) / 2, spacing, pricePool[tokenId]);
     }
 
     /// @notice Positions the daily review goes through.
@@ -683,14 +615,87 @@ contract PositionGuard is AbstractCallback {
         if (behind && netDue) emit NetExitDue(tokenId, net);
         emit Reviewed(tokenId, holdValue, positionValue, aeroValue, behind);
         // Readings are only needed for positions that stay; a close must fit in GAS_PER_REVIEW.
-        if (behind) _close(tokenId, g, g.owner);
-        else _markPays(tokenId, g.pool);
+        if (behind) {
+            _close(tokenId, g, g.owner);
+        } else {
+            _markPays(tokenId, g.pool);
+            _maybeMove(tokenId);
+        }
+    }
+
+    /// @dev Moves a staked position into the alternate pool that has earned the most net of price
+    ///      swings, when it beats the current pool by MOVE_MARGIN at two reviews in a row and neither
+    ///      pool's price is being pushed right now. Readings only: no forecast, nothing unmeasured.
+    function _maybeMove(uint256 tokenId) internal {
+        Guarded memory g = guarded[tokenId];
+        address[] memory alts = alternates[tokenId];
+        if (alts.length == 0 || g.gauge == address(0) || !meter.measured(g.pool)) return;
+        (,,,,, int24 lower, int24 upper,,,,,) = npm.positions(tokenId);
+        int24 half = (upper - lower) / 2;
+        address via = pricePool[tokenId];
+        address target = meter.bestAlternate(alts, half, via, meter.netRate(g.pool, half, via) + int256(MOVE_MARGIN));
+        if (target == address(0)) {
+            delete moveVote[tokenId];
+            return;
+        }
+        if (moveVote[tokenId] != target) {
+            moveVote[tokenId] = target;
+            return;
+        }
+        if (_pushed(g.pool) || _pushed(target)) return;
+        _move(tokenId, g, target, half, alts);
+    }
+
+    /// @dev True when the pool's current price is more than MAX_SPOT_DEVIATION from its 30-minute average.
+    function _pushed(address pool) internal view returns (bool) {
+        (, int24 spot,,,,) = ICLPool(pool).slot0();
+        int24 avg = _twapTick(pool);
+        return (spot > avg ? spot - avg : avg - spot) > MAX_SPOT_DEVIATION;
+    }
+
+    /// @dev Closes the position into the guard and opens one of the same width around the price in
+    ///      `target`, staked and guarded with the same settings. The old pool becomes an alternate.
+    ///      AERO earned and whatever the new range does not take go straight to the owner.
+    function _move(uint256 tokenId, Guarded memory g, address target, int24 half, address[] memory alts) internal {
+        uint16 maxLoss = g.maxLossBps;
+        uint16 netExit = netExitBps[tokenId];
+        uint32 grace = rangeWatch[tokenId].grace;
+        address via = pricePool[tokenId];
+        _close(tokenId, g, address(this));
+
+        (address t0, address t1) = _poolTokens(target);
+        uint256 a0 = IERC20(t0).balanceOf(address(this));
+        uint256 a1 = IERC20(t1).balanceOf(address(this));
+        IERC20(t0).approve(address(npm), a0);
+        IERC20(t1).approve(address(npm), a1);
+        int24 steps = half / ICLPool(target).tickSpacing();
+        uint256 newId = _mintAndRecord(
+            _rangeParams(target, uint16(uint24(steps > 0 ? steps : int24(1))), t0, t1, a0, a1, 0, 0), maxLoss
+        );
+        _guard(newId, g.owner, true, grace);
+        netExitBps[newId] = netExit;
+        pricePool[newId] = via;
+        for (uint256 i = 0; i < alts.length; i++) {
+            if (alts[i] == target) alts[i] = g.pool;
+        }
+        alternates[newId] = alts;
+        _sendAll(t0, g.owner);
+        _sendAll(t1, g.owner);
+        _sendAll(address(aero), g.owner);
+        emit Moved(tokenId, newId, target);
+    }
+
+    /// @dev Sends the guard's whole balance of `token` to `to` and clears its allowance to the position manager.
+    function _sendAll(address token, address to) internal {
+        IERC20(token).approve(address(npm), 0);
+        uint256 bal = IERC20(token).balanceOf(address(this));
+        if (bal > 0 && !IERC20(token).transfer(to, bal)) revert TransferFailed();
     }
 
     /// @dev Takes a new reading of the pool's reward counter, at most once per MIN_PAY_WINDOW, keeping
     ///      the previous one so `payRate` always has a full window to measure over.
     function _markPay(address pool) internal {
-        PoolMath.markPay(payMark[pool], pool);
+        meter.markPay(pool);
     }
 
     /// @dev Reads the reward counter and keeps a price snapshot for the current pool and its alternates.
@@ -701,24 +706,16 @@ contract PositionGuard is AbstractCallback {
         for (uint256 i = 0; i < alts.length; i++) {
             _markPay(alts[i]);
             // a pool too new to have 30 minutes of prices must not stop the review of this position
-            try this.snap(alts[i]) {} catch {}
+            try meter.snap(alts[i]) {} catch {}
         }
     }
 
     /// @dev Keeps the pool's 30-minute average tick, at most once per SNAP_GAP, overwriting the oldest.
     function _snap(address pool) internal {
-        PoolMath.snap(snapLog[pool], pool);
+        meter.snap(pool);
     }
 
-    /// @dev The pool's reward counter brought up to date (see PoolMath.rewardGrowth).
-    function _rewardGrowth(address pool) internal view returns (uint256) {
-        return PoolMath.rewardGrowth(pool);
-    }
 
-    /// @dev What one unit of liquidity is worth in token1, X96 (see PoolMath.valuePerLiquidity).
-    function _valuePerLiquidity(address pool, int24 halfWidth) internal view returns (uint256) {
-        return PoolMath.valuePerLiquidity(pool, halfWidth, sugar);
-    }
 
     /// @dev sqrt price at the pool's average tick over the last TWAP_WINDOW.
     ///      Both the position and holding are valued at this one price (the position at the amounts
@@ -753,7 +750,10 @@ contract PositionGuard is AbstractCallback {
         returns (uint256 tokenId)
     {
         if (p.maxLossBps >= 10_000) revert BadLimit();
-        tokenId = _mintAndRecord(_mintParams(p, token0, token1, amount0, amount1), p.maxLossBps);
+        tokenId = _mintAndRecord(
+            _rangeParams(p.pool, p.halfWidth, token0, token1, amount0, amount1, p.amount0Min, p.amount1Min),
+            p.maxLossBps
+        );
         _guard(tokenId, msg.sender, p.stake, p.graceSeconds);
     }
 
@@ -776,16 +776,21 @@ contract PositionGuard is AbstractCallback {
     }
 
     /// @dev Mint parameters for a range of ± halfWidth tick spacings around the current price.
-    function _mintParams(OpenParams calldata p, address token0, address token1, uint256 amount0, uint256 amount1)
-        internal
-        view
-        returns (INonfungiblePositionManager.MintParams memory)
-    {
-        int24 spacing = ICLPool(p.pool).tickSpacing();
-        (, int24 tick,,,,) = ICLPool(p.pool).slot0();
+    function _rangeParams(
+        address pool,
+        uint16 halfWidth,
+        address token0,
+        address token1,
+        uint256 amount0,
+        uint256 amount1,
+        uint256 min0,
+        uint256 min1
+    ) internal view returns (INonfungiblePositionManager.MintParams memory) {
+        int24 spacing = ICLPool(pool).tickSpacing();
+        (, int24 tick,,,,) = ICLPool(pool).slot0();
         int24 base = tick / spacing;
         if (tick < 0 && tick % spacing != 0) base -= 1; // round down for negative ticks
-        int24 half = int24(uint24(p.halfWidth));
+        int24 half = int24(uint24(halfWidth));
         return INonfungiblePositionManager.MintParams({
             token0: token0,
             token1: token1,
@@ -794,8 +799,8 @@ contract PositionGuard is AbstractCallback {
             tickUpper: (base + 1 + half) * spacing,
             amount0Desired: amount0,
             amount1Desired: amount1,
-            amount0Min: p.amount0Min,
-            amount1Min: p.amount1Min,
+            amount0Min: min0,
+            amount1Min: min1,
             recipient: address(this),
             deadline: block.timestamp,
             sqrtPriceX96: 0
@@ -841,15 +846,9 @@ contract PositionGuard is AbstractCallback {
         _list(tokenId);
         _markPay(pool);
         // a pool too new to have 30 minutes of prices must not stop the deposit
-        try this.snap(pool) {} catch {}
+        try meter.snap(pool) {} catch {}
         rangeWatch[tokenId].grace = graceSeconds;
         emit Deposited(tokenId, owner, gauge);
-        if (graceSeconds > 0) _emitWatch(tokenId, pool, graceSeconds);
-    }
-
-    function _emitWatch(uint256 tokenId, address pool, uint32 graceSeconds) internal {
-        (,,,,, int24 tickLower, int24 tickUpper,,,,,) = npm.positions(tokenId);
-        emit Watch(tokenId, pool, tickLower, tickUpper, graceSeconds);
     }
 
     /// @dev The pool a position sits in.

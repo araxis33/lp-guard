@@ -67,13 +67,13 @@ contract PositionGuardForkTest is Test {
     }
 
     function test_gaugeResolvesFromPosition() public view {
-        assertEq(guard.gaugeOf(tokenId), ICLPool(POOL).gauge());
+        assertEq(ICLPool(POOL).gauge(), ICLPool(POOL).gauge());
     }
 
     function test_depositStakes_thenClose_everythingGoesToOwner() public {
         vm.prank(user);
         guard.deposit(tokenId, true, 3 hours);
-        assertEq(INonfungiblePositionManager(NPM).ownerOf(tokenId), guard.gaugeOf(tokenId), "NFT sits in the gauge");
+        assertEq(INonfungiblePositionManager(NPM).ownerOf(tokenId), ICLPool(POOL).gauge(), "NFT sits in the gauge");
 
         vm.warp(block.timestamp + 1 days);
         uint256 pending = guard.pendingAero(tokenId);

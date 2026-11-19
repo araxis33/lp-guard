@@ -117,10 +117,10 @@ contract PayForkTest is Test {
 
     function test_payRate_zeroUntilAFullWindowHasPassed() public {
         _open(); // takes the first reading of CL100
-        (, uint64 readAt,,) = guard.payMark(CL100);
+        (, uint64 readAt,,) = guard.meter().payMark(CL100);
         assertEq(readAt, vm.getBlockTimestamp());
-        assertEq(guard.payRate(CL100, 500), 0);
-        assertEq(guard.payRate(CL50, 500), 0); // never read
+        assertEq(guard.meter().payRate(CL100, 500), 0);
+        assertEq(guard.meter().payRate(CL50, 500), 0); // never read
     }
 
     /// The pool's reward counter after a day is set by hand: on a fork nobody runs the gauge.
@@ -130,12 +130,12 @@ contract PayForkTest is Test {
         guard.setAlternates(id, _alts(CL50));
         vm.prank(user);
         guard.review(id); // first reading of CL50 (CL100 was read at open, too fresh to read again)
-        (, uint64 at50,,) = guard.payMark(CL50);
+        (, uint64 at50,,) = guard.meter().payMark(CL50);
         assertGt(at50, 0);
 
         // The guard's own readings (counter plus what had accrued unsettled at that moment).
-        (uint256 g100,,,) = guard.payMark(CL100);
-        (uint256 g50,,,) = guard.payMark(CL50);
+        (uint256 g100,,,) = guard.meter().payMark(CL100);
+        (uint256 g50,,,) = guard.meter().payMark(CL50);
         vm.warp(vm.getBlockTimestamp() + 1 days);
         // Only the mocked counters move: no real emissions accrued over the warp.
         _unsettled(CL100, 0);
@@ -145,8 +145,8 @@ contract PayForkTest is Test {
         vm.mockCall(CL100, abi.encodeWithSignature("rewardGrowthGlobalX128()"), abi.encode(g100 + grown));
         vm.mockCall(CL50, abi.encodeWithSignature("rewardGrowthGlobalX128()"), abi.encode(g50 + grown));
 
-        uint256 r100 = guard.payRate(CL100, 500);
-        uint256 r50 = guard.payRate(CL50, 500);
+        uint256 r100 = guard.meter().payRate(CL100, 500);
+        uint256 r50 = guard.meter().payRate(CL50, 500);
         console2.log("pay per second, step 100:", r100);
         console2.log("pay per second, step 50: ", r50);
         assertGt(r100, 0);
@@ -155,11 +155,11 @@ contract PayForkTest is Test {
         assertApproxEqRel(r100, r50, 0.05e18);
 
         // A narrower range holds more liquidity per dollar, so it earns more of the same counter.
-        assertGt(guard.payRate(CL100, 200), r100);
+        assertGt(guard.meter().payRate(CL100, 200), r100);
 
         // Twice the counter growth in step 50: it pays twice as much.
         vm.mockCall(CL50, abi.encodeWithSignature("rewardGrowthGlobalX128()"), abi.encode(g50 + 2 * grown));
-        assertApproxEqRel(guard.payRate(CL50, 500), 2 * r50, 0.01e18);
+        assertApproxEqRel(guard.meter().payRate(CL50, 500), 2 * r50, 0.01e18);
     }
 
     /// Codex 15.11 (1): a quiet pool's counter only moves when the pool is touched. The AERO accrued
@@ -174,13 +174,13 @@ contract PayForkTest is Test {
         // Untouched pool: counter frozen, 50 AERO waiting in the voter.
         vm.mockCall(CL100, abi.encodeWithSignature("rewardGrowthGlobalX128()"), abi.encode(g));
         _unsettled(CL100, aero);
-        uint256 quiet = guard.payRate(CL100, 500);
+        uint256 quiet = guard.meter().payRate(CL100, 500);
         assertGt(quiet, 0);
 
         // The same 50 AERO already settled into the counter: the same pay.
         vm.mockCall(CL100, abi.encodeWithSignature("rewardGrowthGlobalX128()"), abi.encode(g + aero * 2 ** 128 / staked));
         _unsettled(CL100, 0);
-        assertApproxEqRel(guard.payRate(CL100, 500), quiet, 0.001e18);
+        assertApproxEqRel(guard.meter().payRate(CL100, 500), quiet, 0.001e18);
     }
 
     /// Codex 15.11 (2): an alternate pool too young for a 30-minute average (observe reverts "OLD")
@@ -189,13 +189,13 @@ contract PayForkTest is Test {
         uint256 id = _open();
         vm.prank(user);
         guard.setAlternates(id, _alts(CL50));
-        uint256 before = guard.snapsOf(CL100).length;
+        uint256 before = guard.meter().snapsOf(CL100).length;
         vm.warp(vm.getBlockTimestamp() + 1 days);
         vm.mockCallRevert(CL50, abi.encodeWithSelector(ICLPool.observe.selector), "OLD");
         vm.prank(user);
         guard.review(id); // must not revert
-        assertEq(guard.snapsOf(CL100).length, before + 1); // the position's own pool was still read
-        assertEq(guard.snapsOf(CL50).length, 0); // the young alternate simply skipped
+        assertEq(guard.meter().snapsOf(CL100).length, before + 1); // the position's own pool was still read
+        assertEq(guard.meter().snapsOf(CL50).length, 0); // the young alternate simply skipped
     }
 
     /// Codex 16.11: a mark taken with unsettled AERO, then a voter that can't be read, must not
@@ -213,7 +213,7 @@ contract PayForkTest is Test {
         _unsettled(CL50, 1_000e18);
         vm.prank(user);
         guard.review(id);
-        (uint256 g0, uint64 at0,,) = guard.payMark(CL50);
+        (uint256 g0, uint64 at0,,) = guard.meter().payMark(CL50);
         assertEq(at0, vm.getBlockTimestamp());
         assertGt(g0, frozen); // the mark counted the waiting AERO
         // The pool stays untouched and the voter stops answering.
@@ -221,10 +221,10 @@ contract PayForkTest is Test {
         vm.mockCallRevert(ICLGauge(gauge).voter(), abi.encodeCall(ILeafVoter.projectedCumulativeRewardShare, (gauge)), "down");
         vm.warp(vm.getBlockTimestamp() + 13 hours);
         vm.mockCall(CL50, abi.encodeWithSignature("lastUpdated()"), abi.encode(uint48(vm.getBlockTimestamp() - 1)));
-        assertEq(guard.payRate(CL50, 500), 0); // read as no pay measured, not as a wrap
+        assertEq(guard.meter().payRate(CL50, 500), 0); // read as no pay measured, not as a wrap
         vm.prank(user);
         guard.review(id); // takes the next mark
-        (uint256 g1, uint64 at1,,) = guard.payMark(CL50);
+        (uint256 g1, uint64 at1,,) = guard.meter().payMark(CL50);
         assertEq(at1, vm.getBlockTimestamp());
         assertEq(g1, g0); // never moved back
     }
@@ -241,8 +241,8 @@ contract PayForkTest is Test {
         vm.mockCall(CL100, abi.encodeWithSelector(ICLPool.observe.selector), abi.encode(cum, spl));
         uint256 g = ICLPool(CL100).rewardGrowthGlobalX128();
         vm.mockCall(CL100, abi.encodeWithSignature("rewardGrowthGlobalX128()"), abi.encode(g + 1e30));
-        guard.payRate(CL100, 500); // must not revert
-        guard.payRate(CL100, 500_000);
+        guard.meter().payRate(CL100, 500); // must not revert
+        guard.meter().payRate(CL100, 500_000);
     }
 
     /// If the voter can't be read, the counter is taken as it stands and the review still runs.
@@ -254,30 +254,30 @@ contract PayForkTest is Test {
         vm.mockCallRevert(voter, abi.encodeCall(ILeafVoter.projectedCumulativeRewardShare, (gauge)), "down");
         uint256 g = ICLPool(CL100).rewardGrowthGlobalX128();
         vm.mockCall(CL100, abi.encodeWithSignature("rewardGrowthGlobalX128()"), abi.encode(g + 1e30));
-        assertGt(guard.payRate(CL100, 500), 0);
+        assertGt(guard.meter().payRate(CL100, 500), 0);
     }
 
     /// A reading is taken at most once per window, so many reviews in a row cannot shrink it.
     function test_markPay_atMostOncePerWindow_keepsThePreviousReading() public {
         uint256 id = _open();
-        (uint256 g0, uint64 t0,,) = guard.payMark(CL100);
+        (uint256 g0, uint64 t0,,) = guard.meter().payMark(CL100);
 
         vm.warp(vm.getBlockTimestamp() + 1 hours);
         vm.prank(user);
         guard.review(id);
-        (, uint64 t1,,) = guard.payMark(CL100);
+        (, uint64 t1,,) = guard.meter().payMark(CL100);
         assertEq(t1, t0); // too soon: no new reading
 
         vm.warp(vm.getBlockTimestamp() + 12 hours);
         vm.prank(user);
         guard.review(id);
-        (, uint64 t2, uint256 prevG, uint64 prevT) = guard.payMark(CL100);
+        (, uint64 t2, uint256 prevG, uint64 prevT) = guard.meter().payMark(CL100);
         assertEq(t2, vm.getBlockTimestamp());
         assertEq(prevT, t0);
         assertEq(prevG, g0);
         // Right after the new reading the rate is measured from the previous one, not from zero time.
         uint256 g = ICLPool(CL100).rewardGrowthGlobalX128();
         vm.mockCall(CL100, abi.encodeWithSignature("rewardGrowthGlobalX128()"), abi.encode(g + 1e30));
-        assertGt(guard.payRate(CL100, 500), 0);
+        assertGt(guard.meter().payRate(CL100, 500), 0);
     }
 }

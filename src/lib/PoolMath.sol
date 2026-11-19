@@ -8,6 +8,10 @@ import {MulDiv} from "./MulDiv.sol";
 /// @notice Readings of an Aero (Slipstream) pool that PositionGuard needs: its average price, its
 ///         reward counter brought up to date, and what a unit of liquidity is worth. Deployed on its
 ///         own and linked, so PositionGuard fits under the 24 KB contract size limit. Holds no state.
+interface INetRate {
+    function netRate(address pool, int24 halfWidth, address via) external view returns (int256);
+}
+
 library PoolMath {
     using MulDiv for uint256;
 
@@ -171,6 +175,45 @@ library PoolMath {
         if (shared == t1) return inShared;
         if (shared == t0) return _in1(inShared, sugar.getSqrtRatioAtTick(twapTick(pool)));
         revert BadPricePool();
+    }
+
+    /// @notice Whether a pool's pay and its price swings have both been measured.
+    function measured(PayMark storage m, SnapLog storage l) public view returns (bool) {
+        return paySince(m) != 0 && priceVariance(l) != 0;
+    }
+
+    /// @notice Pay (AERO priced in token1) minus expected loss to swings, per second, share of value 1e18.
+    function netRate(
+        PayMark storage m,
+        SnapLog storage l,
+        address pool,
+        int24 halfWidth,
+        address via,
+        address aero,
+        ISugarHelper sugar
+    ) public view returns (int256) {
+        uint256 pay = payRate(m, pool, halfWidth, sugar).mulDiv(aeroPrice(pool, via, aero, sugar), 1e18);
+        return int256(pay) - int256(lossRate(l, pool, halfWidth, sugar));
+    }
+
+    /// @notice The measured alternate pool (with a gauge) that earns the most net of swings, if it beats
+    ///         `floor`; zero otherwise. A pool whose reading fails is skipped.
+    function bestAlternate(
+        mapping(address => PayMark) storage marks,
+        mapping(address => SnapLog) storage logs,
+        address[] memory alts,
+        int24 halfWidth,
+        address via,
+        int256 floor
+    ) public view returns (address target) {
+        for (uint256 i = 0; i < alts.length; i++) {
+            address a = alts[i];
+            if (!measured(marks[a], logs[a]) || ICLPool(a).gauge() == address(0)) continue;
+            // through the guard's own view, so one pool that fails to read does not stop the review
+            try INetRate(address(this)).netRate(a, halfWidth, via) returns (int256 n) {
+                if (n > floor) (floor, target) = (n, a);
+            } catch {}
+        }
     }
 
     function _in1(uint256 amount0, uint160 sqrtP) private pure returns (uint256) {

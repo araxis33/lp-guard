@@ -19,8 +19,8 @@ import {ISystemContract} from "@reactive/src/interfaces/ISystemContract.sol";
 contract GuardReactive is AbstractReactive {
     /// @notice Reactive Network's system contract that emits the Cron timer events.
     address public constant CRON = 0x0000000000000000000000000000000000fffFfF;
-    /// @notice Gas for the daily review callback (two positions, one closing: ~1.13M on a Base fork).
-    uint64 public constant REVIEW_GAS = 3_500_000;
+    /// @notice Gas for the daily review callback: two positions, a move into a better pool ~2.5M each.
+    uint64 public constant REVIEW_GAS = 6_000_000;
     /// @notice Gas for the hourly check callback: up to two positions at 1.3M each (one ~0.17M).
     uint64 public constant CHECK_GAS = 3_000_000;
 

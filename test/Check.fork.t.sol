@@ -81,9 +81,9 @@ contract CheckForkTest is Test {
 
     function test_check_keepsAnHourlySnapshot_soSwingsAreMeasuredWithinHours() public {
         _open(5, 3 hours);
-        assertEq(guard.snapsOf(POOL).length, 1, "a snapshot is kept at the deposit");
+        assertEq(guard.meter().snapsOf(POOL).length, 1, "a snapshot is kept at the deposit");
         _check();
-        assertEq(guard.snapsOf(POOL).length, 1, "not twice within the hour");
+        assertEq(guard.meter().snapsOf(POOL).length, 1, "not twice within the hour");
         _push(true, 20e18);
         _skip(1 hours);
         _check();
@@ -92,9 +92,9 @@ contract CheckForkTest is Test {
         uint256 g0 = gasleft();
         _check();
         console2.log("gas for the hourly check of one position:", g0 - gasleft());
-        PoolMath.Snap[] memory s = guard.snapsOf(POOL);
+        PoolMath.Snap[] memory s = guard.meter().snapsOf(POOL);
         assertEq(s.length, 3, "three snapshots two hours after the deposit");
-        assertGt(guard.priceVariance(POOL), 0, "swings measured on the same day, not after three days");
+        assertGt(guard.meter().priceVariance(POOL), 0, "swings measured on the same day, not after three days");
     }
 
     function test_check_closesAfterTheGracePeriodOutOfRange_andSendsAllToTheOwner() public {
