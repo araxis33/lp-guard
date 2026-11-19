@@ -70,7 +70,7 @@ contract PositionGuardForkTest is Test {
         assertEq(guard.gaugeOf(tokenId), ICLPool(POOL).gauge());
     }
 
-    function test_depositStakes_thenReactiveCloses_everythingGoesToOwner() public {
+    function test_depositStakes_thenClose_everythingGoesToOwner() public {
         vm.prank(user);
         guard.deposit(tokenId, true, 3 hours);
         assertEq(INonfungiblePositionManager(NPM).ownerOf(tokenId), guard.gaugeOf(tokenId), "NFT sits in the gauge");
@@ -82,8 +82,8 @@ contract PositionGuardForkTest is Test {
         uint256 a0 = IERC20(AERO).balanceOf(user);
         uint256 w0 = IERC20(WETH).balanceOf(user);
         uint256 o0 = IERC20(OLD_AERO).balanceOf(user);
-        vm.prank(proxy);
-        guard.closeByReactive(reactive, tokenId);
+        vm.prank(user);
+        guard.close(tokenId);
         console2.log("AERO (new) to owner:", IERC20(AERO).balanceOf(user) - a0);
         console2.log("AERO (old) to owner:", IERC20(OLD_AERO).balanceOf(user) - o0);
         console2.log("WETH to owner:", IERC20(WETH).balanceOf(user) - w0);
@@ -110,12 +110,12 @@ contract PositionGuardForkTest is Test {
         // not the proxy
         vm.prank(stranger);
         vm.expectRevert();
-        guard.closeByReactive(reactive, tokenId);
+        guard.checkByReactive(reactive);
         // the proxy, but relaying some other reactive contract
         vm.prank(proxy);
         vm.expectRevert();
-        guard.closeByReactive(stranger, tokenId);
-        // the reactive contract can close, never withdraw
+        guard.checkByReactive(stranger);
+        // the reactive contract can ask for checks, never withdraw
         vm.prank(proxy);
         vm.expectRevert(PositionGuard.NotOwner.selector);
         guard.withdraw(tokenId);

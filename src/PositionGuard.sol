@@ -83,13 +83,19 @@ contract PositionGuard is AbstractCallback {
 
     mapping(uint256 tokenId => RangeWatch) public rangeWatch;
     /// @notice Most positions one hourly check goes through, so it fits in one callback.
-    uint256 public constant MAX_CHECK = 6;
+    uint256 public constant MAX_CHECK = 2;
+    /// @notice Gas each position may use in the hourly check (the fork test measures a close).
+    uint256 public constant GAS_PER_CHECK = 1_300_000;
     uint256 internal checkCursor;
 
     /// @notice The hourly check saw the price leave a position's range (30-minute average tick).
     event WentOut(uint256 indexed tokenId, int24 averageTick);
     /// @notice The price came back into the range before the grace period ran out.
     event CameBack(uint256 indexed tokenId, int24 averageTick);
+    /// @notice A position's hourly check reverted or ran out of its gas; it is tried again next hour.
+    event CheckFailed(uint256 indexed tokenId);
+    /// @dev Gas for each alternate pool's snapshot in the hourly check.
+    uint256 internal constant SNAP_GAS = 120_000;
 
     /// @notice Per position: the review closes it when the pool's pay minus its expected loss to
     ///         price swings falls below minus this many basis points of its value a day. 0 = off.
@@ -251,6 +257,7 @@ contract PositionGuard is AbstractCallback {
         delete alternates[tokenId];
         delete netExitBps[tokenId];
         delete rangeWatch[tokenId];
+        delete pricePool[tokenId];
         _unlist(tokenId);
         _unstake(tokenId, g, g.owner);
         npm.transferFrom(address(this), g.owner, tokenId);
@@ -359,18 +366,6 @@ contract PositionGuard is AbstractCallback {
         _refund(address(aero));
     }
 
-    /// @notice Same close, asked for by the Reactive contract. `sender_` is filled in by the
-    ///         callback proxy with the Reactive contract's address.
-    function closeByReactive(address sender_, uint256 tokenId)
-        external
-        onlyServiceProvider
-        onlyCallbackSender(sender_)
-    {
-        Guarded memory g = guarded[tokenId];
-        if (g.owner == address(0)) return; // already closed or withdrawn: nothing to do
-        _close(tokenId, g, g.owner);
-    }
-
     /// @notice The daily review of every guarded position, asked for by the Reactive contract's
     ///         timer. A position whose pool has no price history yet is skipped, not closed.
     function reviewByReactive(address sender_) external onlyServiceProvider onlyCallbackSender(sender_) {
@@ -409,11 +404,16 @@ contract PositionGuard is AbstractCallback {
         for (uint256 i = 0; i < n; i++) {
             ids[i] = reviewList[(start + i) % len];
         }
-        checkCursor = start + n;
-        for (uint256 i = 0; i < n; i++) {
-            if (gasleft() < GAS_PER_REVIEW + 50_000) break;
-            try this.checkOne{gas: GAS_PER_REVIEW}(ids[i]) {} catch {}
+        uint256 done;
+        for (; done < n; done++) {
+            if (gasleft() < GAS_PER_CHECK + 50_000) break;
+            try this.checkOne{gas: GAS_PER_CHECK}(ids[done]) {}
+            catch {
+                emit CheckFailed(ids[done]);
+            }
         }
+        // the next check starts at the first position this one did not reach
+        checkCursor = start + done;
     }
 
     /// @dev Called by the guard on itself so one failing position cannot stop the others.
@@ -422,12 +422,18 @@ contract PositionGuard is AbstractCallback {
         Guarded memory g = guarded[tokenId];
         if (g.owner == address(0)) return;
         _snap(g.pool);
+        if (_rangeStep(tokenId, g)) return; // closed
         address[] storage alts = alternates[tokenId];
         for (uint256 i = 0; i < alts.length; i++) {
-            try this.snap(alts[i]) {} catch {}
+            try this.snap{gas: SNAP_GAS}(alts[i]) {} catch {}
         }
+    }
+
+    /// @dev Updates the out-of-range clock of a position and closes it when the grace period is over
+    ///      and both the 30-minute average and the current price are out of range. True if closed.
+    function _rangeStep(uint256 tokenId, Guarded memory g) internal returns (bool) {
         RangeWatch storage w = rangeWatch[tokenId];
-        if (w.grace == 0) return;
+        if (w.grace == 0) return false;
         (,,,,, int24 lower, int24 upper,,,,,) = npm.positions(tokenId);
         int24 avg = _twapTick(g.pool);
         if (avg >= lower && avg < upper) {
@@ -435,21 +441,22 @@ contract PositionGuard is AbstractCallback {
                 w.outSince = 0;
                 emit CameBack(tokenId, avg);
             }
-            return;
+            return false;
         }
         if (w.outSince == 0) {
             w.outSince = uint64(block.timestamp);
             emit WentOut(tokenId, avg);
-            return;
+            return false;
         }
-        if (block.timestamp - w.outSince < w.grace) return;
+        if (block.timestamp - w.outSince < w.grace) return false;
         (, int24 spot,,,,) = ICLPool(g.pool).slot0();
         int24 gap = spot > avg ? spot - avg : avg - spot;
-        if (gap > MAX_SPOT_DEVIATION) {
+        if (gap > MAX_SPOT_DEVIATION || (spot >= lower && spot < upper)) {
             emit CloseDeferred(tokenId, spot, avg);
-            return;
+            return false;
         }
         _close(tokenId, g, g.owner);
+        return true;
     }
 
     /// @dev Unstakes, removes all liquidity and sends the tokens, fees and AERO to `to` (the owner,
@@ -459,6 +466,7 @@ contract PositionGuard is AbstractCallback {
         delete alternates[tokenId];
         delete netExitBps[tokenId];
         delete rangeWatch[tokenId];
+        delete pricePool[tokenId];
         _unlist(tokenId);
 
         uint256 aeroPaid = _unstake(tokenId, g, to);

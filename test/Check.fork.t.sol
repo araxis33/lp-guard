@@ -116,7 +116,9 @@ contract CheckForkTest is Test {
         uint256 wethBefore = IERC20(WETH).balanceOf(user);
         uint256 aeroBefore = IERC20(AERO).balanceOf(user);
         _skip(1 hours);
+        uint256 g0 = gasleft();
         _check();
+        console2.log("gas for an hourly check that closes:", g0 - gasleft());
         (owner,,,,,,) = guard.guarded(id);
         assertEq(owner, address(0), "closed after three hours out");
         assertEq(INonfungiblePositionManager(NPM).ownerOf(id), user, "empty NFT back");
@@ -139,13 +141,10 @@ contract CheckForkTest is Test {
         _skip(31 minutes);
         _check();
         (, outSince) = guard.rangeWatch(id);
-        (, int24 avg) = (0, PoolMath.twapTick(POOL));
+        int24 avg = PoolMath.twapTick(POOL);
         (,,,,, int24 lower, int24 upper,,,,,) = INonfungiblePositionManager(NPM).positions(id);
-        if (avg >= lower && avg < upper) {
-            assertEq(outSince, 0, "back inside: the clock starts over");
-        } else {
-            console2.log("push back missed the range; avg tick:", int256(avg));
-        }
+        assertTrue(avg >= lower && avg < upper, "the push back must land inside the range");
+        assertEq(outSince, 0, "back inside: the clock starts over");
     }
 
     function test_check_withoutGrace_neverCloses() public {

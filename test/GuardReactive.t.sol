@@ -8,24 +8,20 @@ import {ISystemContract} from "@reactive/src/interfaces/ISystemContract.sol";
 
 /// Stands in for Reactive's system contract at 0x8888…: records subscriptions and callback requests.
 contract MockSystem {
-    struct Sub {
-        uint256 chainId;
-        address c;
-        uint256 topic0;
-    }
-    Sub[] public subs;
+    uint256 public subs;
+    uint256 public unsubs;
     ISystemContract.CallbackConfiguration_V_1_0[] internal reqs;
 
-    function subscribe(uint256 chainId, address c, uint256 topic0, uint256, uint256, uint256) external {
-        subs.push(Sub(chainId, c, topic0));
+    function subscribe(uint256, address, uint256, uint256, uint256, uint256) external {
+        subs++;
+    }
+
+    function unsubscribe(uint256, address, uint256, uint256, uint256, uint256) external {
+        unsubs++;
     }
 
     function requestCallbackV_1_0(ISystemContract.CallbackConfiguration_V_1_0 memory cfg) external {
         reqs.push(cfg);
-    }
-
-    function subCount() external view returns (uint256) {
-        return subs.length;
     }
 
     function reqCount() external view returns (uint256) {
@@ -39,27 +35,26 @@ contract MockSystem {
     function debt(address) external pure returns (uint256) {
         return 0;
     }
+
     receive() external payable {}
 }
 
 contract GuardReactiveTest is Test {
     address constant SYSTEM = 0x8888888888888888888888888888888888888888;
+    address constant CRON = 0x0000000000000000000000000000000000fffFfF;
     uint256 constant BASE = 8453;
+    uint256 constant TICK = 0xd214e1d84db704ed42d37f538ea9bf71e44ba28bc1cc088b2f5deca654677a56;
     address guard = makeAddr("guard");
-    address pool = makeAddr("pool");
     GuardReactive rx;
     MockSystem sys;
-    uint256 clock = 1_000_000; // explicit clock: with via-IR, block.timestamp read in a test can be stale after vm.warp
-    uint256 WATCH; // cached: a getter call would use up vm.prank
-    uint256 UNWATCH;
-    uint256 SWAP;
+    uint256 clock = 1_000_000;
 
     function setUp() public {
         vm.etch(SYSTEM, address(new MockSystem()).code);
         sys = MockSystem(payable(SYSTEM));
-        rx = new GuardReactive(BASE);
+        rx = new GuardReactive{value: 10 ether}(BASE);
         rx.setGuard(guard);
-        (WATCH, UNWATCH, SWAP) = (rx.WATCH_TOPIC(), rx.UNWATCH_TOPIC(), rx.SWAP_TOPIC());
+        rx.start(TICK, 1 hours, 1 days);
         vm.warp(clock);
     }
 
@@ -68,174 +63,108 @@ contract GuardReactiveTest is Test {
         vm.warp(clock);
     }
 
-    function _log(address c, uint256 t0, uint256 t1, uint256 t2, bytes memory data)
-        internal
-        pure
-        returns (IReactive.LogRecord memory l)
-    {
-        l.chainId = BASE;
-        l.contractAddress = c;
-        l.topic0 = t0;
-        l.topic1 = t1;
-        l.topic2 = t2;
-        l.data = data;
-    }
-
-    function _watch(uint256 id, int24 lo, int24 hi, uint32 grace) internal {
-        vm.prank(SYSTEM);
-        rx.react(_log(guard, WATCH, id, uint256(uint160(pool)), abi.encode(lo, hi, grace)));
-    }
-
-    function _swap(int24 tick) internal {
-        vm.prank(SYSTEM);
-        rx.react(_log(pool, SWAP, 0, 0, abi.encode(int256(1), int256(-1), uint160(1), uint128(1), tick)));
-    }
-
-    function test_setGuardSubscribesToGuardEvents() public view {
-        assertEq(sys.subCount(), 2);
-    }
-
-    function test_watchSubscribesToPoolOnce() public {
-        _watch(1, -100, 100, 3 hours);
-        _watch(2, -200, 200, 3 hours);
-        assertEq(sys.subCount(), 3, "one pool subscription for both positions");
-        assertEq(rx.watchedCount(pool), 2);
-    }
-
-    function test_closesOnlyAfterGraceOutOfRange() public {
-        _watch(1, -100, 100, 3 hours);
-        _swap(0); // inside
-        _swap(150); // goes out: clock starts
-        _skip(2 hours);
-        _swap(160); // still out, grace not over
-        assertEq(sys.reqCount(), 0);
-        _skip(61 minutes);
-        _swap(170); // out for 3 h 1 min
-        assertEq(sys.reqCount(), 1);
-        ISystemContract.CallbackConfiguration_V_1_0 memory r = sys.req(0);
-        assertEq(r.chainId, BASE);
-        assertEq(r.recipient, guard);
-        assertEq(r.payload, abi.encodeWithSignature("closeByReactive(address,uint256)", address(0), uint256(1)));
-        assertEq(rx.watchedCount(pool), 0, "no longer watched");
-        _swap(180);
-        assertEq(sys.reqCount(), 1, "asked once");
-    }
-
-    function test_comingBackResetsTheClock() public {
-        _watch(1, -100, 100, 3 hours);
-        _swap(150);
-        _skip(2 hours);
-        _swap(50); // back inside
-        _skip(2 hours);
-        _swap(150); // out again: a fresh clock
-        _skip(2 hours);
-        _swap(150);
-        assertEq(sys.reqCount(), 0);
-    }
-
-    function test_upperBoundIsOutside_lowerIsInside() public {
-        _watch(1, -100, 100, 1);
-        _swap(-100);
-        _skip(10);
-        _swap(-100);
-        assertEq(sys.reqCount(), 0, "tickLower is inside");
-        _swap(100);
-        _skip(10);
-        _swap(100);
-        assertEq(sys.reqCount(), 1, "tickUpper is outside");
-    }
-
-    function test_unwatchStops() public {
-        _watch(1, -100, 100, 1);
-        vm.prank(SYSTEM);
-        rx.react(_log(guard, UNWATCH, 1, 0, ""));
-        _swap(500);
-        _skip(10);
-        _swap(500);
-        assertEq(sys.reqCount(), 0);
-    }
-
-    function test_twoPositionsOneClosesOtherStays() public {
-        _watch(1, -100, 100, 1 hours);
-        _watch(2, -1000, 1000, 1 hours);
-        _swap(300);
-        _skip(2 hours);
-        _swap(300);
-        assertEq(sys.reqCount(), 1);
-        assertEq(rx.watchedCount(pool), 1);
-    }
-
-    function test_onlySystemCanReact() public {
-        vm.expectRevert();
-        rx.react(_log(guard, WATCH, 1, uint256(uint160(pool)), abi.encode(int24(-1), int24(1), uint32(1))));
-    }
-
-    function test_ignoresOtherChainsAndUnknownPools() public {
-        _watch(1, -100, 100, 1);
-        IReactive.LogRecord memory l =
-            _log(pool, SWAP, 0, 0, abi.encode(int256(1), int256(-1), uint160(1), uint128(1), int24(500)));
-        l.chainId = 1;
-        vm.prank(SYSTEM);
-        rx.react(l);
-        _skip(10);
-        vm.prank(SYSTEM);
-        rx.react(l);
-        assertEq(sys.reqCount(), 0);
-    }
-
-    // ---- daily review timer ----
-
-    uint256 constant CRON_TOPIC = 0xb49937fb8970e19fd46d48f7e3fb00d659deac0347f79cd7cb542f0fc1503c70; // a Cron topic seen on mainnet
-    address constant CRON = 0x0000000000000000000000000000000000fffFfF;
-
-    function _tick(uint256 topic) internal {
-        IReactive.LogRecord memory l = _log(CRON, topic, 0, 0, "");
-        l.chainId = block.chainid; // Cron events come from the Reactive chain itself
+    function _tick() internal {
+        IReactive.LogRecord memory l;
+        l.chainId = block.chainid;
+        l.contractAddress = CRON;
+        l.topic0 = TICK;
         vm.prank(SYSTEM);
         rx.react(l);
     }
 
-    function test_setReview_onlyDeployer_once_subscribesToCron() public {
-        vm.prank(makeAddr("someone"));
-        vm.expectRevert(GuardReactive.NotDeployer.selector);
-        rx.setReview(CRON_TOPIC, 1 days);
-        rx.setReview(CRON_TOPIC, 1 days);
-        assertEq(sys.subCount(), 3, "one more subscription: the timer");
-        (uint256 chainId, address c, uint256 topic0) = sys.subs(2);
-        assertEq(chainId, block.chainid);
-        assertEq(c, CRON);
-        assertEq(topic0, CRON_TOPIC);
-        vm.expectRevert(GuardReactive.ReviewAlreadySet.selector);
-        rx.setReview(CRON_TOPIC, 1 days);
+    function _payload(uint256 i) internal view returns (bytes memory) {
+        return sys.req(i).payload;
     }
 
-    function test_setReview_needsTheGuardFirst() public {
-        GuardReactive fresh = new GuardReactive(BASE);
-        vm.expectRevert(GuardReactive.GuardNotSet.selector);
-        fresh.setReview(CRON_TOPIC, 1 days);
-    }
+    function test_firstTick_runsTheReview_thenHourlyChecks_thenTheNextReview() public {
+        _tick();
+        assertEq(sys.reqCount(), 1);
+        assertEq(_payload(0), abi.encodeWithSignature("reviewByReactive(address)", address(0)));
+        assertEq(sys.req(0).recipient, guard);
+        assertEq(sys.req(0).chainId, BASE);
 
-    function test_reviewAtMostOncePerInterval() public {
-        rx.setReview(CRON_TOPIC, 1 days);
-        _tick(CRON_TOPIC); // first tick: review
-        assertEq(sys.reqCount(), 1);
-        ISystemContract.CallbackConfiguration_V_1_0 memory r = sys.req(0);
-        assertEq(r.chainId, BASE);
-        assertEq(r.recipient, guard);
-        assertEq(r.payload, abi.encodeWithSignature("reviewByReactive(address)", address(0)));
-        _skip(12 hours);
-        _tick(CRON_TOPIC); // too early
-        assertEq(sys.reqCount(), 1);
-        _skip(12 hours);
-        _tick(CRON_TOPIC); // a day later
+        _skip(17 minutes);
+        _tick();
+        assertEq(sys.reqCount(), 1, "not within the hour");
+
+        _skip(43 minutes);
+        _tick();
         assertEq(sys.reqCount(), 2);
+        assertEq(_payload(1), abi.encodeWithSignature("checkByReactive(address)", address(0)));
+
+        for (uint256 i = 0; i < 22; i++) {
+            _skip(1 hours);
+            _tick();
+        }
+        assertEq(sys.reqCount(), 24, "23 checks and a review in the first day");
+        _skip(1 hours);
+        _tick();
+        assertEq(_payload(24), abi.encodeWithSignature("reviewByReactive(address)", address(0)), "next day's review");
     }
 
-    function test_timerIgnoresOtherTopicsAndIsOffUntilSet() public {
-        _tick(CRON_TOPIC); // review not switched on yet
+    function test_ignoresOtherEvents() public {
+        IReactive.LogRecord memory l;
+        l.contractAddress = makeAddr("pool");
+        l.topic0 = TICK;
+        vm.prank(SYSTEM);
+        rx.react(l);
         assertEq(sys.reqCount(), 0);
-        rx.setReview(CRON_TOPIC, 1 days);
-        _tick(uint256(keccak256("some other cron")));
-        assertEq(sys.reqCount(), 0);
+    }
+
+    function test_onlyTheSystemCanReact() public {
+        IReactive.LogRecord memory l;
+        l.contractAddress = CRON;
+        l.topic0 = TICK;
+        vm.expectRevert();
+        rx.react(l);
+    }
+
+    function test_stop_endsTheTicks_andCanStartAgain() public {
+        rx.stop();
+        assertEq(sys.unsubs(), 1);
+        _tick();
+        assertEq(sys.reqCount(), 0, "clock off: nothing asked, nothing spent on callbacks");
+        rx.start(TICK, 1 hours, 1 days);
+        _tick();
+        assertEq(sys.reqCount(), 1);
+    }
+
+    function test_deployerOnly() public {
+        address stranger = makeAddr("stranger");
+        vm.startPrank(stranger);
+        vm.expectRevert(GuardReactive.NotDeployer.selector);
+        rx.setGuard(stranger);
+        vm.expectRevert(GuardReactive.NotDeployer.selector);
+        rx.stop();
+        vm.expectRevert(GuardReactive.NotDeployer.selector);
+        rx.withdraw(payable(stranger), 1);
+        vm.expectRevert(GuardReactive.NotDeployer.selector);
+        rx.start(TICK, 1 hours, 1 days);
+        vm.stopPrank();
+    }
+
+    function test_withdraw_givesTheReactBack() public {
+        address payable to = payable(makeAddr("owner"));
+        rx.withdraw(to, 4 ether);
+        assertEq(to.balance, 4 ether);
+        assertEq(address(rx).balance, 6 ether);
+    }
+
+    function test_setGuard_movesTheClockToANewGuard() public {
+        address next = makeAddr("guardV2");
+        rx.setGuard(next);
+        _tick();
+        assertEq(sys.req(0).recipient, next);
+    }
+
+    function test_start_checksItsArguments() public {
+        rx.stop();
+        vm.expectRevert(GuardReactive.BadPeriod.selector);
+        rx.start(TICK, 0, 1 days);
+        vm.expectRevert(GuardReactive.BadPeriod.selector);
+        rx.start(TICK, 2 days, 1 days);
+        rx.start(TICK, 1 hours, 1 days);
+        vm.expectRevert(GuardReactive.ClockRunning.selector);
+        rx.start(TICK, 1 hours, 1 days);
     }
 }
