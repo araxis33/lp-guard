@@ -74,6 +74,7 @@ contract PositionGuard is AbstractCallback {
     /// @notice For a pool without AERO in it: the pool the owner named to price AERO (AERO paired
     ///         with one of the position's two tokens). Zero when not set.
     mapping(uint256 tokenId => address) public pricePool;
+
     /// @dev Per position: how long the price may stay out of range before the hourly check closes it
     ///      (0 = never), and since when it has been out (0 = inside at the last check).
     struct RangeWatch {
@@ -164,7 +165,7 @@ contract PositionGuard is AbstractCallback {
     uint160 internal constant MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342;
 
     /// @dev Set only while the guard itself takes in a position NFT (see onERC721Received).
-    uint256 transient internal nftExpected;
+    uint256 internal transient nftExpected;
 
     /// @dev The pool the guard is swapping in right now; only it may ask to be paid.
     address internal swapPool;
@@ -510,7 +511,6 @@ contract PositionGuard is AbstractCallback {
 
     // ---- views ----
 
-
     /// @notice AERO the position has earned in the gauge and not yet claimed.
     function pendingAero(uint256 tokenId) external view returns (uint256) {
         Guarded memory g = guarded[tokenId];
@@ -531,8 +531,6 @@ contract PositionGuard is AbstractCallback {
         if (g.owner == address(0)) revert NotGuarded();
         return meter.standing(tokenId, g.pool, g.entry0, g.entry1, g.aeroPaid, pricePool[tokenId]);
     }
-
-
 
     /// @notice The other pools this position may be moved into.
     function alternatesOf(uint256 tokenId) external view returns (address[] memory) {
@@ -722,8 +720,6 @@ contract PositionGuard is AbstractCallback {
     function _snap(address pool) internal {
         meter.snap(pool);
     }
-
-
 
     /// @dev sqrt price at the pool's average tick over the last TWAP_WINDOW.
     ///      Both the position and holding are valued at this one price (the position at the amounts

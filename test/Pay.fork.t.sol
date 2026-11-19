@@ -58,7 +58,9 @@ contract PayForkTest is Test {
         address gauge = ICLPool(pool).gauge();
         address voter = ICLGauge(gauge).voter();
         uint256 settled = ICLGauge(gauge).lastCumulativeRewardShare();
-        vm.mockCall(voter, abi.encodeCall(ILeafVoter.projectedCumulativeRewardShare, (gauge)), abi.encode(settled + extra));
+        vm.mockCall(
+            voter, abi.encodeCall(ILeafVoter.projectedCumulativeRewardShare, (gauge)), abi.encode(settled + extra)
+        );
     }
 
     function _alts(address a) internal pure returns (address[] memory pools) {
@@ -178,7 +180,9 @@ contract PayForkTest is Test {
         assertGt(quiet, 0);
 
         // The same 50 AERO already settled into the counter: the same pay.
-        vm.mockCall(CL100, abi.encodeWithSignature("rewardGrowthGlobalX128()"), abi.encode(g + aero * 2 ** 128 / staked));
+        vm.mockCall(
+            CL100, abi.encodeWithSignature("rewardGrowthGlobalX128()"), abi.encode(g + aero * 2 ** 128 / staked)
+        );
         _unsettled(CL100, 0);
         assertApproxEqRel(guard.meter().payRate(CL100, 500), quiet, 0.001e18);
     }
@@ -218,7 +222,9 @@ contract PayForkTest is Test {
         assertGt(g0, frozen); // the mark counted the waiting AERO
         // The pool stays untouched and the voter stops answering.
         address gauge = ICLPool(CL50).gauge();
-        vm.mockCallRevert(ICLGauge(gauge).voter(), abi.encodeCall(ILeafVoter.projectedCumulativeRewardShare, (gauge)), "down");
+        vm.mockCallRevert(
+            ICLGauge(gauge).voter(), abi.encodeCall(ILeafVoter.projectedCumulativeRewardShare, (gauge)), "down"
+        );
         vm.warp(vm.getBlockTimestamp() + 13 hours);
         vm.mockCall(CL50, abi.encodeWithSignature("lastUpdated()"), abi.encode(uint48(vm.getBlockTimestamp() - 1)));
         assertEq(guard.meter().payRate(CL50, 500), 0); // read as no pay measured, not as a wrap

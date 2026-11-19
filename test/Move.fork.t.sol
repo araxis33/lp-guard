@@ -133,7 +133,9 @@ contract MoveForkTest is Test {
         assertEq(IERC20(WETH).balanceOf(address(guard)), 0, "guard keeps no WETH");
         assertEq(IERC20(USDC).balanceOf(address(guard)), 0, "guard keeps no USDC");
         assertEq(IERC20(AERO).balanceOf(address(guard)), 0, "guard keeps no AERO");
-        console2.log("leftover WETH / USDC to owner:", IERC20(WETH).balanceOf(user) - w0, IERC20(USDC).balanceOf(user) - u0);
+        console2.log(
+            "leftover WETH / USDC to owner:", IERC20(WETH).balanceOf(user) - w0, IERC20(USDC).balanceOf(user) - u0
+        );
     }
 
     function test_move_fitsTheDailyRunByReactive() public {
@@ -229,7 +231,8 @@ contract MoveForkTest is Test {
 /// Sells WETH into a WETH/USDC pool (WETH is token0) to move its price.
 contract Pusher {
     function push(address pool, address weth) external {
-        ICLPool(pool).swap(address(this), true, int256(IERC20(weth).balanceOf(address(this))), 4295128740, abi.encode(weth));
+        ICLPool(pool)
+            .swap(address(this), true, int256(IERC20(weth).balanceOf(address(this))), 4295128740, abi.encode(weth));
     }
 
     function uniswapV3SwapCallback(int256 a0, int256 a1, bytes calldata data) external {

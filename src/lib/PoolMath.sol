@@ -127,8 +127,9 @@ library PoolMath {
         view
         returns (uint256)
     {
-        (uint256 base, uint64 since) =
-            block.timestamp - m.readAt >= MIN_PAY_WINDOW ? (m.growth, m.readAt) : (m.prevGrowth, m.prevReadAt);
+        (uint256 base, uint64 since) = block.timestamp - m.readAt >= MIN_PAY_WINDOW
+            ? (m.growth, m.readAt)
+            : (m.prevGrowth, m.prevReadAt);
         if (since == 0) return 0;
         uint256 current = rewardGrowth(pool);
         uint256 grown = current > base ? current - base : 0;

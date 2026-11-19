@@ -103,8 +103,15 @@ contract LifecycleForkTest is Test {
         IERC20A(USDC).approve(address(guard), type(uint256).max);
         uint256 id = guard.open(
             PositionGuard.OpenParams({
-                pool: CL50, amount0: 1e18, amount1: 3_000e6, halfWidth: 20, amount0Min: 0, amount1Min: 0,
-                stake: true, graceSeconds: 3 hours, maxLossBps: 300
+                pool: CL50,
+                amount0: 1e18,
+                amount1: 3_000e6,
+                halfWidth: 20,
+                amount0Min: 0,
+                amount1Min: 0,
+                stake: true,
+                graceSeconds: 3 hours,
+                maxLossBps: 300
             })
         );
         guard.setPricePool(id, VIA);
@@ -148,13 +155,14 @@ contract LifecycleForkTest is Test {
 
 contract Trader {
     function swap(address pool, bool zeroForOne, address tokenIn) external {
-        ICLPool(pool).swap(
-            address(this),
-            zeroForOne,
-            int256(IERC20(tokenIn).balanceOf(address(this)) / 20),
-            zeroForOne ? 4295128740 : 1461446703485210103287273052203988822378723970341,
-            abi.encode(tokenIn)
-        );
+        ICLPool(pool)
+            .swap(
+                address(this),
+                zeroForOne,
+                int256(IERC20(tokenIn).balanceOf(address(this)) / 20),
+                zeroForOne ? 4295128740 : 1461446703485210103287273052203988822378723970341,
+                abi.encode(tokenIn)
+            );
     }
 
     function uniswapV3SwapCallback(int256 a0, int256 a1, bytes calldata data) external {
