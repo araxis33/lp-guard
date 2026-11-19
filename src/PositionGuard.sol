@@ -98,6 +98,9 @@ contract PositionGuard is AbstractCallback {
     /// @dev Per position: the alternate pool the last review found better. A move happens only when
     ///      two reviews in a row (two days) point at the same pool.
     mapping(uint256 tokenId => address) public moveVote;
+    mapping(uint256 tokenId => uint64) internal moveVoteAt;
+    /// @notice Least time between the two reviews that must agree before a move.
+    uint64 public constant MOVE_WAIT = 20 hours;
     /// @notice The review moved a position into a pool that earns more. Coins that did not fit the
     ///         new range at the moment of the move went straight to the owner.
     event Moved(uint256 indexed fromTokenId, uint256 indexed toTokenId, address indexed pool);
@@ -187,7 +190,7 @@ contract PositionGuard is AbstractCallback {
         npm = INonfungiblePositionManager(npm_);
         aero = IERC20(aero_);
         sugar = ISugarHelper(sugar_);
-        meter = new GuardMeter(INonfungiblePositionManager(npm_).factory(), aero_, sugar_);
+        meter = new GuardMeter(npm_, aero_, sugar_);
     }
 
     // ---- owner ----
@@ -266,6 +269,7 @@ contract PositionGuard is AbstractCallback {
         delete rangeWatch[tokenId];
         delete pricePool[tokenId];
         delete moveVote[tokenId];
+        delete moveVoteAt[tokenId];
         _unlist(tokenId);
         _unstake(tokenId, g, g.owner);
         npm.transferFrom(address(this), g.owner, tokenId);
@@ -384,12 +388,16 @@ contract PositionGuard is AbstractCallback {
         for (uint256 i = 0; i < n; i++) {
             ids[i] = reviewList[(start + i) % len];
         }
-        // Next run starts where this one stops, so every position gets its turn.
-        reviewCursor = start + n;
-        for (uint256 i = 0; i < n; i++) {
+        uint256 done;
+        for (; done < n; done++) {
             if (gasleft() < GAS_PER_REVIEW + 50_000) break;
-            try this.reviewOne{gas: GAS_PER_REVIEW}(ids[i]) {} catch {}
+            try this.reviewOne{gas: GAS_PER_REVIEW}(ids[done]) {}
+            catch {
+                emit CheckFailed(ids[done]);
+            }
         }
+        // Next run starts at the first position this one did not reach, so every position gets its turn.
+        reviewCursor = start + done;
     }
 
     /// @dev Called by the guard on itself so one failing position cannot stop the others.
@@ -475,6 +483,7 @@ contract PositionGuard is AbstractCallback {
         delete rangeWatch[tokenId];
         delete pricePool[tokenId];
         delete moveVote[tokenId];
+        delete moveVoteAt[tokenId];
         _unlist(tokenId);
 
         uint256 aeroPaid = _unstake(tokenId, g, to);
@@ -517,31 +526,10 @@ contract PositionGuard is AbstractCallback {
     {
         Guarded storage g = guarded[tokenId];
         if (g.owner == address(0)) revert NotGuarded();
-        uint160 sqrtP = _twapSqrt(g.pool);
-        holdValue = _in1(g.entry0, sqrtP) + g.entry1;
-        positionValue = _positionValue(tokenId, sqrtP);
-        aeroValue = _aeroValue(g.pool, g.aeroPaid, sqrtP);
-        address via = pricePool[tokenId];
-        if (aeroValue == 0 && g.aeroPaid > 0 && via != address(0)) {
-            // the pool has no AERO in it: price the AERO paid through the owner's price pool
-            aeroValue = g.aeroPaid.mulDiv(meter.aeroPrice(g.pool, via), 1e18);
-        }
+        return meter.standing(tokenId, g.pool, g.entry0, g.entry1, g.aeroPaid, pricePool[tokenId]);
     }
 
-    /// @dev The position's tokens plus its unclaimed fees, in token1.
-    function _positionValue(uint256 tokenId, uint160 sqrtP) internal view returns (uint256) {
-        (uint256 p0, uint256 p1) = sugar.principal(address(npm), tokenId, sqrtP);
-        (uint256 f0, uint256 f1) = sugar.fees(address(npm), tokenId);
-        return _in1(p0 + f0, sqrtP) + p1 + f1;
-    }
 
-    /// @dev AERO in token1, when AERO is one of the pool's tokens; otherwise zero here and `standing`
-    ///      prices it through the owner's price pool, if one is set.
-    function _aeroValue(address pool, uint256 amount, uint160 sqrtP) internal view returns (uint256) {
-        if (ICLPool(pool).token0() == address(aero)) return _in1(amount, sqrtP);
-        if (ICLPool(pool).token1() == address(aero)) return amount;
-        return 0;
-    }
 
     /// @notice The other pools this position may be moved into.
     function alternatesOf(uint256 tokenId) external view returns (address[] memory) {
@@ -619,17 +607,27 @@ contract PositionGuard is AbstractCallback {
             _close(tokenId, g, g.owner);
         } else {
             _markPays(tokenId, g.pool);
-            _maybeMove(tokenId);
+            // a pool that fails to read or a mint that reverts must not undo the review
+            try this.moveStep(tokenId) {} catch {}
         }
     }
 
     /// @dev Moves a staked position into the alternate pool that has earned the most net of price
     ///      swings, when it beats the current pool by MOVE_MARGIN at two reviews in a row and neither
     ///      pool's price is being pushed right now. Readings only: no forecast, nothing unmeasured.
+    /// @dev Called by the guard on itself from the review (see `_maybeMove`).
+    function moveStep(uint256 tokenId) external {
+        if (msg.sender != address(this)) revert NotOwner();
+        _maybeMove(tokenId);
+    }
+
     function _maybeMove(uint256 tokenId) internal {
         Guarded memory g = guarded[tokenId];
         address[] memory alts = alternates[tokenId];
-        if (alts.length == 0 || g.gauge == address(0) || !meter.measured(g.pool)) return;
+        if (alts.length == 0 || g.gauge == address(0)) return;
+        // only on a full reading of the current pool: pay, swings, a price for AERO, a real width
+        (, bool ok) = netPerDay(tokenId);
+        if (!ok) return;
         (,,,,, int24 lower, int24 upper,,,,,) = npm.positions(tokenId);
         int24 half = (upper - lower) / 2;
         address via = pricePool[tokenId];
@@ -640,9 +638,13 @@ contract PositionGuard is AbstractCallback {
         }
         if (moveVote[tokenId] != target) {
             moveVote[tokenId] = target;
+            moveVoteAt[tokenId] = uint64(block.timestamp);
             return;
         }
-        if (_pushed(g.pool) || _pushed(target)) return;
+        if (block.timestamp < moveVoteAt[tokenId] + MOVE_WAIT) return;
+        // both pools trade the same pair: their averages must agree, and neither may be pushed now
+        int24 d = _twapTick(g.pool) - _twapTick(target);
+        if (_pushed(g.pool) || _pushed(target) || d > MAX_SPOT_DEVIATION || -d > MAX_SPOT_DEVIATION) return;
         _move(tokenId, g, target, half, alts);
     }
 
@@ -661,11 +663,14 @@ contract PositionGuard is AbstractCallback {
         uint16 netExit = netExitBps[tokenId];
         uint32 grace = rangeWatch[tokenId].grace;
         address via = pricePool[tokenId];
-        _close(tokenId, g, address(this));
-
         (address t0, address t1) = _poolTokens(target);
-        uint256 a0 = IERC20(t0).balanceOf(address(this));
-        uint256 a1 = IERC20(t1).balanceOf(address(this));
+        // count only what this position returns, never coins that happen to sit on the guard
+        uint256 b0 = IERC20(t0).balanceOf(address(this));
+        uint256 b1 = IERC20(t1).balanceOf(address(this));
+        uint256 bA = aero.balanceOf(address(this));
+        _close(tokenId, g, address(this));
+        uint256 a0 = IERC20(t0).balanceOf(address(this)) - b0;
+        uint256 a1 = IERC20(t1).balanceOf(address(this)) - b1;
         IERC20(t0).approve(address(npm), a0);
         IERC20(t1).approve(address(npm), a1);
         int24 steps = half / ICLPool(target).tickSpacing();
@@ -679,17 +684,17 @@ contract PositionGuard is AbstractCallback {
             if (alts[i] == target) alts[i] = g.pool;
         }
         alternates[newId] = alts;
-        _sendAll(t0, g.owner);
-        _sendAll(t1, g.owner);
-        _sendAll(address(aero), g.owner);
+        _sendNew(t0, g.owner, b0);
+        _sendNew(t1, g.owner, b1);
+        if (address(aero) != t0 && address(aero) != t1) _sendNew(address(aero), g.owner, bA);
         emit Moved(tokenId, newId, target);
     }
 
-    /// @dev Sends the guard's whole balance of `token` to `to` and clears its allowance to the position manager.
-    function _sendAll(address token, address to) internal {
+    /// @dev Sends `to` what the guard holds of `token` above `before`, and clears the position manager's allowance.
+    function _sendNew(address token, address to, uint256 before) internal {
         IERC20(token).approve(address(npm), 0);
         uint256 bal = IERC20(token).balanceOf(address(this));
-        if (bal > 0 && !IERC20(token).transfer(to, bal)) revert TransferFailed();
+        if (bal > before && !IERC20(token).transfer(to, bal - before)) revert TransferFailed();
     }
 
     /// @dev Takes a new reading of the pool's reward counter, at most once per MIN_PAY_WINDOW, keeping

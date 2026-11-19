@@ -151,6 +151,34 @@ contract MoveForkTest is Test {
         assertEq(pool, CL100);
     }
 
+    function test_move_twoReviewsMinutesApart_doNotMove() public {
+        uint256 id = _open();
+        _cl100Wins();
+        _skip(1 days);
+        _review(id);
+        _skip(10 minutes);
+        _review(id);
+        (address owner,,,,,,) = guard.guarded(id);
+        assertEq(owner, user, "the two agreeing reviews must be at least 20 hours apart");
+        _skip(20 hours);
+        _review(id);
+        (owner,,,,,,) = guard.guarded(id);
+        assertEq(owner, address(0), "moved once the wait is over");
+    }
+
+    function test_move_leavesCoinsThatAreNotThePositions() public {
+        uint256 id = _open();
+        _cl100Wins();
+        _skip(1 days);
+        _review(id);
+        _skip(1 days);
+        deal(WETH, address(guard), 0.5e18); // someone else's coins sitting on the guard
+        _review(id);
+        (address owner,,,,,,) = guard.guarded(id);
+        assertEq(owner, address(0), "moved");
+        assertEq(IERC20(WETH).balanceOf(address(guard)), 0.5e18, "coins that were not the position's stay put");
+    }
+
     function test_move_notWhileThePriceIsBeingPushed() public {
         uint256 id = _open();
         _cl100Wins();

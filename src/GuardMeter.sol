@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.29;
 
-import {ICLFactory, ICLPool, ISugarHelper} from "./interfaces/IAero.sol";
+import {ICLFactory, ICLPool, ISugarHelper, INonfungiblePositionManager} from "./interfaces/IAero.sol";
 import {PoolMath} from "./lib/PoolMath.sol";
+import {MulDiv} from "./lib/MulDiv.sol";
 
 /// @title GuardMeter
 /// @notice The PositionGuard's measurements of Aero (Slipstream) pools, kept apart from the guard so the
@@ -16,7 +17,10 @@ import {PoolMath} from "./lib/PoolMath.sol";
 ///         Only the guard that created it takes pay readings; anyone may take a price snapshot, since a
 ///         snapshot is the pool's own 30-minute average and more of them only measure over more points.
 contract GuardMeter {
+    using MulDiv for uint256;
+
     address public immutable guard;
+    address public immutable npm;
     ICLFactory public immutable factory;
     address public immutable aero;
     ISugarHelper public immutable sugar;
@@ -27,9 +31,10 @@ contract GuardMeter {
     error NotGuard();
     error UnknownPool();
 
-    constructor(address factory_, address aero_, address sugar_) {
+    constructor(address npm_, address aero_, address sugar_) {
         guard = msg.sender;
-        factory = ICLFactory(factory_);
+        npm = npm_;
+        factory = ICLFactory(INonfungiblePositionManager(npm_).factory());
         aero = aero_;
         sugar = ISugarHelper(sugar_);
     }
@@ -121,6 +126,28 @@ contract GuardMeter {
         returns (address)
     {
         return PoolMath.bestAlternate(payMark, snapLog, alts, halfWidth, via, floor);
+    }
+
+    /// @notice A position against simply holding, all in the pool's token1 at the 30-minute average:
+    ///         what the tokens put in would be worth held, what the position holds now with its unclaimed
+    ///         fees, and what the AERO paid so far is worth (through `via` when the pool has no AERO).
+    function standing(uint256 tokenId, address pool, uint256 entry0, uint256 entry1, uint256 aeroPaid, address via)
+        external
+        view
+        returns (uint256 holdValue, uint256 positionValue, uint256 aeroValue)
+    {
+        uint160 sqrtP = sugar.getSqrtRatioAtTick(PoolMath.twapTick(pool));
+        holdValue = _in1(entry0, sqrtP) + entry1;
+        (uint256 p0, uint256 p1) = sugar.principal(npm, tokenId, sqrtP);
+        (uint256 f0, uint256 f1) = sugar.fees(npm, tokenId);
+        positionValue = _in1(p0 + f0, sqrtP) + p1 + f1;
+        if (ICLPool(pool).token0() == aero) aeroValue = _in1(aeroPaid, sqrtP);
+        else if (ICLPool(pool).token1() == aero) aeroValue = aeroPaid;
+        else if (aeroPaid > 0 && via != address(0)) aeroValue = aeroPaid.mulDiv(aeroPrice(pool, via), 1e18);
+    }
+
+    function _in1(uint256 amount0, uint160 sqrtP) internal pure returns (uint256) {
+        return amount0.mulDiv(sqrtP, 2 ** 96).mulDiv(sqrtP, 2 ** 96);
     }
 
     function _check(address pool) internal view {

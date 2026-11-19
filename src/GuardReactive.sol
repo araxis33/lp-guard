@@ -63,6 +63,7 @@ contract GuardReactive is AbstractReactive {
     ///         this contract's address), and a later version of the guard can take over the same
     ///         clock and the same REACT.
     function setGuard(address guard_) external onlyDeployer {
+        if (guard_ == address(0)) revert GuardNotSet();
         guard = guard_;
         emit GuardSet(guard_);
     }
@@ -72,7 +73,7 @@ contract GuardReactive is AbstractReactive {
     function start(uint256 cronTopic_, uint32 checkEvery_, uint32 reviewEvery_) external onlyDeployer {
         if (guard == address(0)) revert GuardNotSet();
         if (cronTopic != 0) revert ClockRunning();
-        if (checkEvery_ == 0 || reviewEvery_ < checkEvery_) revert BadPeriod();
+        if (cronTopic_ == 0 || checkEvery_ == 0 || reviewEvery_ < checkEvery_) revert BadPeriod();
         cronTopic = cronTopic_;
         checkEvery = checkEvery_;
         reviewEvery = reviewEvery_;
