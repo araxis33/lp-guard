@@ -93,6 +93,11 @@ a{color:var(--blue)}
     ["0xD0Acf293547457Fb4fE9eE32CA93e89497626816", "AERO / USDC · Aero CL200"],
     ["0xc85D5CB72d1aaD6f152A8decAd228AE4A59Ac9B3", "AERO / WETH · Aero CL200"],
   ];
+  // Other pools of the same two tokens, with a gauge, that a position may move into when they pay more
+  const ALTS = {
+    "0x4a7af46bc8abc00048c6c7920a1488daf568366c": [["0x2A430bEbD2082d8e05D56d64DEDE8944279bbC24", "WETH / USDC · Aero CL100"]],
+    "0xd0acf293547457fb4fe9ee32ca93e89497626816": [["0x422dF9aa896e883c9CDcBad309C0785b7364A1cF", "AERO / USDC · Aero CL100"]],
+  };
   const HALF_WIDTH = 5, MAX_LOSS_BPS = 300, GRACE = 3 * 3600, SWAP_FLOOR_BPS = 9900; // 1% worst price on the swaps in
   const MIN_USDC = 1;
   const NET_EXIT_BPS = 10; // leave when the pool pays less than its price swings cost, by more than 0.10% a day
@@ -103,6 +108,7 @@ a{color:var(--blue)}
     approve: "0x095ea7b3", fee: "0xddca3f43", allowance: "0xdd62ed3e", balanceOf: "0x70a08231", token0: "0x0dfe1681", token1: "0xd21220a7", slot0: "0x3850c7bd",
     openWith: "0x8ea9db67", standing: "0xe73f3e5d", netPerDay: "0x39dad9b0", guarded: "0x5e284975", review: "0xe1e96c9b", close: "0x0aebeb4e",
     pendingAero: "0xee2beb63", reviewList: "0x3c01ec2b", reviewCount: "0xeff5924f", setPricePool: "0xb036f298", setNetExit: "0x4eac38d5", pricePool: "0x3a25d732", netExitBps: "0x62eff892",
+    setAlternates: "0xfd68fff5", alternatesOf: "0x1e0b8430",
   };
   const st = { account: null, busy: false };
   const el = (id) => document.getElementById(id);
@@ -197,6 +203,9 @@ a{color:var(--blue)}
     throw new Error("Timed out waiting for the " + what + ".");
   }
 
+  // setAlternates(id, pools): the position may move into these pools when they pay more
+  const altsCall = (id, pools) => SEL.setAlternates + word(id) + word(64) + word(pools.length) + pools.map((a) => addr(a[0])).join("");
+
   async function putIn() {
     const raw = el("amt").value.trim();
     if (!/^\d+(\.\d{0,6})?$/.test(raw) || Number(raw) < MIN_USDC) throw new Error("Type at least " + MIN_USDC + " USDC.");
@@ -225,7 +234,8 @@ a{color:var(--blue)}
       await send(SEL.approve + addr(CFG.guard) + word(amount), USDC, "approval");
     }
     const hasAero = [info.token0, info.token1].some((t) => t.toLowerCase() === AERO.toLowerCase());
-    const total = hasAero ? 3 : 4;
+    const alts = ALTS[pool.toLowerCase()] || [];
+    const total = (hasAero ? 3 : 4) + (alts.length ? 1 : 0);
     status("st-open", "Step 2 of " + total + ": put it in. Confirm in your wallet…");
     const leg = (l) => addr(l[0]) + word(l[1]) + word(l[2]);
     const params = addr(pool) + word(0) + word(0) + word(HALF_WIDTH) + word(0) + word(0) + word(1) + word(GRACE) + word(MAX_LOSS_BPS);
@@ -241,8 +251,12 @@ a{color:var(--blue)}
         await send(SEL.setPricePool + word(id) + addr(via), CFG.guard, "AERO pricing");
       }
     }
-    status("st-open", "Step " + total + " of " + total + ": switch on the exit for when the pool stops paying. Confirm in your wallet…");
+    status("st-open", "Step " + (total - (alts.length ? 1 : 0)) + " of " + total + ": switch on the exit for when the pool stops paying. Confirm in your wallet…");
     await send(SEL.setNetExit + word(id) + word(NET_EXIT_BPS), CFG.guard, "exit rule");
+    if (alts.length) {
+      status("st-open", "Step " + total + " of " + total + ": let the guard move it into " + esc(alts.map((a) => a[1]).join(", ")) + " when that pool pays more. Confirm in your wallet…");
+      await send(altsCall(id, alts), CFG.guard, "moving");
+    }
     } catch (err) {
       refresh();
       throw new Error("Position #" + id + " is open, but its setup is not finished (" + (/rejected|denied/i.test(err.message || "") ? "cancelled in the wallet" : err.message) + "). Finish it with the button on its card below.");
@@ -276,6 +290,8 @@ a{color:var(--blue)}
     const netExit = Number(big(words(await call(CFG.guard, SEL.netExitBps + word(pos.id)))[0]));
     const hasAero = [info.token0, info.token1].some((t) => t.toLowerCase() === AERO.toLowerCase());
     const priced = hasAero || words(await call(CFG.guard, SEL.pricePool + word(pos.id)))[0].slice(24) !== "0".repeat(40);
+    const altsSet = Number(big(words(await call(CFG.guard, SEL.alternatesOf + word(pos.id)))[1] || "0"));
+    const canMove = (ALTS[pos.pool.toLowerCase()] || []).length > 0;
     // AERO already paid is priced here directly, so the card is right even where the guard cannot price it
     const [holdU, nowU, aeroU, pendU] = await Promise.all([inUsd(t1, hold), inUsd(t1, now), inUsd(AERO, pos.aeroPaid), inUsd(AERO, pend)]);
     let vs = holdU > 0 ? ((nowU + aeroU) / holdU - 1) * 100 : 0;
@@ -292,10 +308,12 @@ a{color:var(--blue)}
       '<button class="ghost" data-act="close" data-id="' + pos.id + '">Close and take back</button>' +
       (priced ? "" : '<button data-act="price" data-id="' + pos.id + '">Count the AERO it earns</button>') +
       (netExit ? "" : '<button data-act="netexit" data-id="' + pos.id + '">Turn on exit when the pool stops paying</button>') +
+      (canMove && !altsSet ? '<button data-act="move" data-id="' + pos.id + '">Let it move to a pool that pays more</button>' : "") +
       '<span class="small dim">' + (!priced ? '<span class="warn">The guard cannot count the AERO of this pool yet, so it judges it without it.</span> ' : "") +
       (!netExit ? '<span class="warn">Exit when the pool stops paying is off.</span> ' :
         measured ? "Leaves if it loses over " + (netExit / 100).toFixed(2) + "% a day. " :
-        "Exit rule set at " + (netExit / 100).toFixed(2) + "% a day; it acts once the pool has been measured (at least 12 hours). ") +
+        "Exit rule set at " + (netExit / 100).toFixed(2) + "% a day; it acts once the pool has been measured (its pay over 12 hours, its swings within a few hours). ") +
+      (altsSet ? "Moves to the other pool of this pair when it pays at least 0.05% a day more, two days running. " : "") +
       "</span></div></div>";
   }
 
@@ -320,6 +338,12 @@ a{color:var(--blue)}
     try {
       if (b.dataset.act === "review") await send(SEL.review + word(id), CFG.guard, "review");
       else if (b.dataset.act === "netexit") await send(SEL.setNetExit + word(id) + word(NET_EXIT_BPS), CFG.guard, "exit rule");
+      else if (b.dataset.act === "move") {
+        const g = words(await call(CFG.guard, SEL.guarded + word(id)));
+        const alts = ALTS[("0x" + g[2].slice(24)).toLowerCase()] || [];
+        if (!alts.length) throw new Error("No other pool of this pair to move into.");
+        await send(altsCall(id, alts), CFG.guard, "moving");
+      }
       else if (b.dataset.act === "price") {
         const g = words(await call(CFG.guard, SEL.guarded + word(id)));
         const info = await poolInfo("0x" + g[2].slice(24));
