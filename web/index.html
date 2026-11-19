@@ -75,7 +75,7 @@ a{color:var(--blue)}
   const q = new URLSearchParams(location.search);
   // The guard you approve USDC to is fixed here. Only a page opened from this computer
   // (localhost) may point at a local fork, so a crafted link cannot swap in another spender.
-  const LIVE_GUARD = "0x249f0A7145Fa806F64DdeE142b7F8453152b2f15";
+  const LIVE_GUARD = "0x426B54428325Cc674a7f97D435CB0Dff160C01Dd";
   const LOCAL = location.hostname === "127.0.0.1" || location.hostname === "localhost";
   const CFG = {
     rpc: LOCAL && q.get("rpc") ? q.get("rpc") : "https://mainnet.base.org",

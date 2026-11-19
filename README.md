@@ -14,14 +14,25 @@ Built for the Reactive Omni Buildathon, track "Set It and Forget It".
 
 Page: https://araxis33.github.io/lp-guard/
 
-## Mainnet deployment
+## Mainnet deployment (v1.1, 19 Nov 2026)
 
-- `PositionGuard` (Base 8453): `0x249f0A7145Fa806F64DdeE142b7F8453152b2f15`
-- `PoolMath` library (Base 8453): `0xf20870781a64e36C8260d4FC4f390bd0AFaBdcba`
-- `GuardReactive` (Reactive 1597): `0x339c03A3De7d128C2b04ee54A90f5bD285fBc7e8`
+- `PositionGuard` (Base 8453): `0x426B54428325Cc674a7f97D435CB0Dff160C01Dd`
+- `GuardMeter` (Base 8453, created by the guard): `0xB6eF3b5Fd211aE0e8237E4C5F55d3Ab113EaD297`
+- `PoolMath` library (Base 8453): `0xE4Dab7bE03f21f576B78a1E84c4c268cC8D3dF04`
+- `GuardReactive` (Reactive 1597): `0xAC3987961BD8e05b707D984023014Af6F4260bac`
 
-Deployed with `script/live.sh deploy`. The daily review runs on Reactive's Cron10000 timer,
-at most once a day per position.
+Deployed with `script/live.sh deploy`. `GuardReactive` is the guard's clock: on Reactive's Cron1000
+event (about every 17 minutes) it asks the guard on Base for the hourly check (price snapshots, the
+out-of-range close) or, once a day, the review (against holding, the net rule, a move into a pool of
+the same pair that pays more). It does not react to swaps, so a busy pool does not burn REACT.
+Its deployer can stop the clock, point it at a new guard and take back the REACT it holds.
+What is on chain and what is not is tracked in [STATUS.md](STATUS.md).
+
+Known limit: an NFT sent to the guard with a plain `transferFrom` (not through `deposit`) cannot be
+noticed by the guard and has no owner on record. Always use the page or `deposit`.
+
+v1.0 (18 Nov, below) is still on chain: PositionGuard `0x249f0A7145Fa806F64DdeE142b7F8453152b2f15`,
+GuardReactive `0x339c03A3De7d128C2b04ee54A90f5bD285fBc7e8` (reacts to every swap, no REACT withdraw).
 
 ### Mainnet full loop (18 Nov 2026)
 
