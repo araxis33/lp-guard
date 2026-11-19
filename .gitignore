@@ -21,3 +21,5 @@ docs/
 .live-state
 .probe-state
 .state.*
+.env.rehearse
+.rehearse-state
