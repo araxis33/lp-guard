@@ -31,6 +31,7 @@ read_() { local v; v=$(cast "$@") || { echo "read failed: cast $*" >&2; exit 1; 
 
 # The state file belongs to one pair of chains: refuse to reuse it against others (e.g. a fork).
 BASE_ID=$(read_ chain-id --rpc-url "$BASE_RPC"); REACT_ID=$(read_ chain-id --rpc-url "$REACT_RPC")
+[ "$BASE_ID" = 8453 ] && [ "$REACT_ID" = 1597 ] || { echo "expected Base 8453 and Reactive 1597, got $BASE_ID / $REACT_ID"; exit 1; }
 if [ -z "${CHAINS:-}" ]; then save CHAINS "$BASE_ID-$REACT_ID"; CHAINS="$BASE_ID-$REACT_ID"
 elif [ "$CHAINS" != "$BASE_ID-$REACT_ID" ]; then echo "$STATE is for chains $CHAINS, RPCs are $BASE_ID-$REACT_ID"; exit 1; fi
 
@@ -74,13 +75,13 @@ deploy)
   [ -z "${WIRED:-}" ] && {
     cast send "$RX" "setGuard(address)" "$PG" --rpc-url "$REACT_RPC" --private-key "$LIVE_PRIVATE_KEY" | ok
     save WIRED 1; echo "wired: GuardReactive calls $PG"; }
+  [ -z "${FUNDED:-}" ] && {
+    cast send $PROXY "depositTo(address)" "$PG" --value "$CB_VALUE" --rpc-url "$BASE_RPC" --private-key "$LIVE_PRIVATE_KEY" | ok
+    save FUNDED 1; echo "callbacks funded: $CB_VALUE"; }
   [ "$(read_ call "$RX" 'cronTopic()(uint256)' --rpc-url "$REACT_RPC")" != "0" ] && CLOCK=1
   [ -z "${CLOCK:-}" ] && {
     cast send "$RX" "start(uint256,uint32,uint32)" $CRON1000 $CHECK_EVERY $REVIEW_EVERY --rpc-url "$REACT_RPC" --private-key "$LIVE_PRIVATE_KEY" | ok
     save CLOCK 1; echo "clock on: check every ${CHECK_EVERY}s, review every ${REVIEW_EVERY}s (Cron1000)"; }
-  [ -z "${FUNDED:-}" ] && {
-    cast send $PROXY "depositTo(address)" "$PG" --value "$CB_VALUE" --rpc-url "$BASE_RPC" --private-key "$LIVE_PRIVATE_KEY" | ok
-    save FUNDED 1; echo "callbacks funded: $CB_VALUE"; }
   "$0" status
   ;;
 status)

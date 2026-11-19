@@ -387,6 +387,13 @@ contract PositionGuardForkTest is Test {
         assertEq(IERC20(AERO).balanceOf(address(guard)), 0);
         assertEq(IERC20(WETH).balanceOf(address(guard)), 0);
     }
+
+    function test_aPositionSentStraightToTheGuard_isRefused() public {
+        vm.prank(user);
+        vm.expectRevert();
+        INonfungiblePositionManager(NPM).safeTransferFrom(user, address(guard), tokenId);
+        assertEq(INonfungiblePositionManager(NPM).ownerOf(tokenId), user, "the owner keeps it");
+    }
 }
 
 /// Looks like a pool but is not one the factory made.

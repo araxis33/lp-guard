@@ -163,6 +163,9 @@ contract PositionGuard is AbstractCallback {
     uint160 internal constant MIN_SQRT_RATIO = 4295128739;
     uint160 internal constant MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342;
 
+    /// @dev Set only while the guard itself takes in a position NFT (see onERC721Received).
+    uint256 transient internal nftExpected;
+
     /// @dev The pool the guard is swapping in right now; only it may ask to be paid.
     address internal swapPool;
 
@@ -769,7 +772,9 @@ contract PositionGuard is AbstractCallback {
     {
         uint256 used0;
         uint256 used1;
+        nftExpected = 1;
         (tokenId,, used0, used1) = npm.mint(m);
+        nftExpected = 0;
         _record(tokenId, maxLossBps, used0, used1);
     }
 
@@ -902,7 +907,9 @@ contract PositionGuard is AbstractCallback {
         uint256[] memory ids = new uint256[](1);
         ids[0] = tokenId;
         ICLGauge(g.gauge).claimEmissions(address(this), to, ids);
+        nftExpected = 1;
         ICLGauge(g.gauge).withdraw(tokenId);
+        nftExpected = 0;
         // Anything the gauge paid to the guard itself on withdraw belongs to this position's owner.
         if (to != address(this)) {
             uint256 stray = aero.balanceOf(address(this)) - selfBefore;
@@ -911,7 +918,10 @@ contract PositionGuard is AbstractCallback {
         aeroPaid = aero.balanceOf(to) - toBefore;
     }
 
-    function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
+    /// @dev Only NFTs the guard is taking in itself (a gauge returning a position, or a mint) are
+    ///      accepted: one sent here any other way would have no owner on record and could not be withdrawn.
+    function onERC721Received(address, address, uint256, bytes calldata) external view returns (bytes4) {
+        if (msg.sender != address(npm) || nftExpected == 0) revert NotGuarded();
         return this.onERC721Received.selector;
     }
 }
