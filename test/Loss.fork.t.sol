@@ -2,6 +2,7 @@
 pragma solidity ^0.8.29;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {PoolMath} from "../src/lib/PoolMath.sol";
 import {PositionGuard} from "../src/PositionGuard.sol";
 import {Swapper} from "./Review.fork.t.sol";
 
@@ -91,7 +92,7 @@ contract LossForkTest is Test {
             guard.snap(POOL);
             _hourLater();
         }
-        PositionGuard.Snap[] memory s = guard.snapsOf(POOL);
+        PoolMath.Snap[] memory s = guard.snapsOf(POOL);
         assertEq(s.length, 24);
         for (uint256 i = 1; i < s.length; i++) {
             assertGt(s[i].at, s[i - 1].at); // oldest first, no gaps
