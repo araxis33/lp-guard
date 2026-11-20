@@ -66,6 +66,7 @@ a{color:var(--blue)}
   <section class="card">
     <h2>Your positions</h2>
     <div id="mine" class="dim small">Connect a wallet to see them.</div>
+    <div id="st-mine" class="status"></div>
   </section>
 
   <p class="small dim" id="foot"></p>
@@ -76,6 +77,9 @@ a{color:var(--blue)}
   // The guard you approve USDC to is fixed here. Only a page opened from this computer
   // (localhost) may point at a local fork, so a crafted link cannot swap in another spender.
   const LIVE_GUARD = "0x426B54428325Cc674a7f97D435CB0Dff160C01Dd";
+  // Earlier versions of the guard: positions still in them can be moved into the current one as they are.
+  const OLD_GUARDS = ["0x249f0A7145Fa806F64DdeE142b7F8453152b2f15"];
+  const NPM = "0x4857DB576eE0e45F10525eC59527BfD10beeC60b"; // Aero Slipstream position NFTs
   const LOCAL = location.hostname === "127.0.0.1" || location.hostname === "localhost";
   const CFG = {
     rpc: LOCAL && q.get("rpc") ? q.get("rpc") : "https://mainnet.base.org",
@@ -109,6 +113,7 @@ a{color:var(--blue)}
     openWith: "0x8ea9db67", standing: "0xe73f3e5d", netPerDay: "0x39dad9b0", guarded: "0x5e284975", review: "0xe1e96c9b", close: "0x0aebeb4e",
     pendingAero: "0xee2beb63", reviewList: "0x3c01ec2b", reviewCount: "0xeff5924f", setPricePool: "0xb036f298", setNetExit: "0x4eac38d5", pricePool: "0x3a25d732", netExitBps: "0x62eff892",
     setAlternates: "0xfd68fff5", alternatesOf: "0x1e0b8430",
+    deposit: "0x7b6f6669", withdraw: "0x2e1a7d4d", getApproved: "0x081812fc", ownerOf: "0x6352211e", setMaxLoss: "0x17100711", tokenOfOwnerByIndex: "0x2f745c59",
   };
   const st = { account: null, busy: false };
   const el = (id) => document.getElementById(id);
@@ -193,14 +198,15 @@ a{color:var(--blue)}
     if (!now || now.toLowerCase() !== st.account.toLowerCase()) throw new Error("The wallet switched account. Reload the page.");
     const hash = await p.request({ method: "eth_sendTransaction", params: [{ from: st.account, to, data, gas: "0x" + gas.toString(16) }] });
     for (let i = 0; i < 90; i++) {
-      const r = await rpc("eth_getTransactionReceipt", [hash]);
+      let r = null;
+      try { r = await rpc("eth_getTransactionReceipt", [hash]); } catch (e) {} // a busy node: ask again
       if (r && r.blockNumber) {
         if (r.status === "0x0") throw new Error("The " + what + " reverted onchain. Nothing moved but gas.");
         return r;
       }
       await sleep(2000);
     }
-    throw new Error("Timed out waiting for the " + what + ".");
+    throw new Error("Timed out waiting for the " + what + ". It may still go through: check " + hash + " on basescan.org, then reload the page.");
   }
 
   // setAlternates(id, pools): the position may move into these pools when they pay more
@@ -265,18 +271,101 @@ a{color:var(--blue)}
     refresh();
   }
 
-  async function myPositions() {
-    const n = Number(big(words(await call(CFG.guard, SEL.reviewCount))[0]));
-    const ids = (await Promise.allSettled([...Array(n).keys()].map(async (i) => big(words(await call(CFG.guard, SEL.reviewList + word(i)))[0]))))
+  async function myPositions(guard = CFG.guard) {
+    const n = Number(big(words(await call(guard, SEL.reviewCount))[0]));
+    const ids = (await Promise.allSettled([...Array(n).keys()].map(async (i) => big(words(await call(guard, SEL.reviewList + word(i)))[0]))))
       .filter((x) => x.status === "fulfilled").map((x) => x.value);
     const out = [];
     for (const id of new Set(ids)) {
       let g;
-      try { g = words(await call(CFG.guard, SEL.guarded + word(id))); } catch (e) { continue; }
+      try { g = words(await call(guard, SEL.guarded + word(id))); } catch (e) { continue; }
       if (("0x" + g[0].slice(24)).toLowerCase() !== st.account.toLowerCase()) continue;
-      out.push({ id, gauge: "0x" + g[1].slice(24), pool: "0x" + g[2].slice(24), aeroPaid: big(g[6]) });
+      out.push({ id, gauge: "0x" + g[1].slice(24), pool: "0x" + g[2].slice(24), maxLoss: Number(big(g[3])), aeroPaid: big(g[6]) });
     }
     return out;
+  }
+
+  // ---- moving a position from an earlier guard into the current one, as it is (no swaps) ----
+  const MOVING_KEY = "lpg-moving"; // ids taken out of an old guard but not yet handed to the new one
+  function moving() { try { return JSON.parse(localStorage.getItem(MOVING_KEY) || "[]"); } catch (e) { return []; } }
+  function setMoving(ids) { try { localStorage.setItem(MOVING_KEY, JSON.stringify([...new Set(ids)])); } catch (e) {} }
+  const ownerOf = async (id) => ("0x" + words(await call(NPM, SEL.ownerOf + word(id)))[0].slice(24)).toLowerCase();
+
+  // Positions this wallet still has in an old guard, plus ones a move left in the wallet halfway.
+  async function toMove() {
+    const out = [];
+    for (const old of OLD_GUARDS) {
+      try { for (const p of await myPositions(old)) out.push({ id: p.id, pool: p.pool, where: "old" }); } catch (e) {}
+    }
+    const inWallet = new Set(moving());
+    try {
+      const n = Number(big(words(await call(NPM, SEL.balanceOf + addr(st.account)))[0]));
+      for (let i = 0; i < Math.min(n, 20); i++) inWallet.add(big(words(await call(NPM, SEL.tokenOfOwnerByIndex + addr(st.account) + word(i)))[0]).toString());
+    } catch (e) {}
+    for (const s of inWallet) {
+      const id = BigInt(s);
+      if (out.some((p) => p.id === id)) continue;
+      try { if ((await ownerOf(id)) === st.account.toLowerCase()) out.push({ id, pool: null, where: "wallet" }); } catch (e) {}
+    }
+    return out;
+  }
+
+  function moveCard(p) {
+    const name = p.pool ? (POOLS.find((x) => x[0].toLowerCase() === p.pool.toLowerCase()) || [0, p.pool])[1] : "";
+    return '<div class="pos"><div class="pos-head"><span>#' + p.id + (name ? " · " + esc(name) : "") + "</span>" +
+      '<span class="warn">' + (p.where === "old" ? "in the previous guard" : "in your wallet, not guarded") + "</span></div>" +
+      '<div class="row"><button data-act="movein" data-id="' + p.id + '">Move to the current guard</button>' +
+      '<span class="small dim">The same position moves as it is, no swaps. Signatures: take it out' +
+      (p.where === "old" ? " (its AERO comes to you)" : "") + ", allow the new guard, hand it over, then its rules one by one, as for a new position.</span></div></div>";
+  }
+
+  async function moveIn(id) {
+    const me = st.account.toLowerCase();
+    // a staked position's NFT sits in the gauge, so ask each old guard whose position it records
+    let from = null;
+    for (const g of OLD_GUARDS) {
+      try { if (("0x" + words(await call(g, SEL.guarded + word(id)))[0].slice(24)).toLowerCase() === me) { from = g; break; } } catch (e) {}
+    }
+    let o;
+    if (from) {
+      setMoving([...moving(), id.toString()]);
+      status("st-mine", "Step 1 of 4: taking #" + id + " out of the previous guard…");
+      await send(SEL.withdraw + word(id), from, "withdrawal");
+    }
+    o = await ownerOf(id);
+    if (o !== me) throw new Error("Position #" + id + " is not in your wallet.");
+    const approved = ("0x" + words(await call(NPM, SEL.getApproved + word(id)))[0].slice(24)).toLowerCase();
+    if (approved !== CFG.guard.toLowerCase()) {
+      status("st-mine", "Step 2 of 4: allowing the current guard to take #" + id + "…");
+      await send(SEL.approve + addr(CFG.guard) + word(id), NPM, "approval");
+    }
+    status("st-mine", "Step 3: handing #" + id + " to the current guard, staked for AERO…");
+    await send(SEL.deposit + word(id) + word(1) + word(GRACE), CFG.guard, "deposit");
+    setMoving(moving().filter((s) => s !== id.toString()));
+    // the same rules a new position gets when it is put in
+    try {
+      status("st-mine", "Step 4: the " + (MAX_LOSS_BPS / 100) + "% loss rule…");
+      await send(SEL.setMaxLoss + word(id) + word(MAX_LOSS_BPS), CFG.guard, "loss rule");
+      const pool = "0x" + words(await call(CFG.guard, SEL.guarded + word(id)))[2].slice(24);
+      const info = await poolInfo(pool);
+      if (![info.token0, info.token1].some((t) => t.toLowerCase() === AERO.toLowerCase())) {
+        const via = AERO_PRICE_VIA[info.token1.toLowerCase()] || AERO_PRICE_VIA[info.token0.toLowerCase()];
+        if (via) {
+          status("st-mine", "Step 5: let the guard count the AERO this pool pays…");
+          await send(SEL.setPricePool + word(id) + addr(via), CFG.guard, "AERO pricing");
+        }
+      }
+      status("st-mine", "Step 6: switch on the exit for when the pool stops paying…");
+      await send(SEL.setNetExit + word(id) + word(NET_EXIT_BPS), CFG.guard, "exit rule");
+      const alts = ALTS[pool.toLowerCase()] || [];
+      if (alts.length) {
+        status("st-mine", "Step 7: let the guard move it into " + esc(alts.map((x) => x[1]).join(", ")) + " when that pool pays more…");
+        await send(altsCall(id, alts), CFG.guard, "moving");
+      }
+    } catch (err) {
+      throw new Error("#" + id + " is in the current guard, but its setup is not finished (" + (/rejected|denied/i.test(err.message || "") ? "cancelled in the wallet" : err.message) + "). Finish it with the buttons on its card.");
+    }
+    status("st-mine", "Done. #" + id + " is in the current guard with all its rules.", false, true);
   }
 
   async function card(pos) {
@@ -306,6 +395,7 @@ a{color:var(--blue)}
       "<div>" + netTxt + "<span>pool pays minus price swings, per day</span></div></div>" +
       '<div class="row"><button class="ghost" data-act="review" data-id="' + pos.id + '">Review now</button>' +
       '<button class="ghost" data-act="close" data-id="' + pos.id + '">Close and take back</button>' +
+      (pos.maxLoss ? "" : '<button data-act="maxloss" data-id="' + pos.id + '">Turn on the ' + (MAX_LOSS_BPS / 100) + "% loss rule</button>") +
       (priced ? "" : '<button data-act="price" data-id="' + pos.id + '">Count the AERO it earns</button>') +
       (netExit ? "" : '<button data-act="netexit" data-id="' + pos.id + '">Turn on exit when the pool stops paying</button>') +
       (canMove && !altsSet ? '<button data-act="move" data-id="' + pos.id + '">Let it move to a pool that pays more</button>' : "") +
@@ -321,10 +411,13 @@ a{color:var(--blue)}
     if (!st.account) return;
     const box = el("mine");
     try {
-      const mine = await myPositions();
-      if (!mine.length) { box.innerHTML = "No positions yet."; return; }
+      const [m, o] = await Promise.allSettled([myPositions(), toMove()]);
+      if (m.status === "rejected" && o.status === "rejected") throw m.reason;
+      const mine = m.status === "fulfilled" ? m.value : [], old = o.status === "fulfilled" ? o.value : [];
+      if (m.status === "rejected") status("st-mine", "Could not read the guard just now (" + esc(m.reason && m.reason.message) + "). Reload to see all positions.", true);
+      if (!mine.length && !old.length) { box.innerHTML = "No positions yet."; return; }
       const cards = await Promise.allSettled(mine.map(card));
-      box.innerHTML = cards.map((c, i) => c.status === "fulfilled" ? c.value :
+      box.innerHTML = old.map(moveCard).join("") + cards.map((c, i) => c.status === "fulfilled" ? c.value :
         '<div class="pos"><div class="pos-head"><span>#' + mine[i].id + '</span><span class="bad">could not read: ' + esc(c.reason && c.reason.message) + "</span></div>" +
         '<div class="row"><button class="ghost" data-act="close" data-id="' + mine[i].id + '">Close and take back</button></div></div>').join("");
     } catch (e) { box.innerHTML = '<span class="bad">' + esc(e.message) + "</span>"; }
@@ -336,7 +429,9 @@ a{color:var(--blue)}
     st.busy = true; b.disabled = true;
     const id = BigInt(b.dataset.id);
     try {
-      if (b.dataset.act === "review") await send(SEL.review + word(id), CFG.guard, "review");
+      if (b.dataset.act === "movein") await moveIn(id);
+      else if (b.dataset.act === "maxloss") await send(SEL.setMaxLoss + word(id) + word(MAX_LOSS_BPS), CFG.guard, "loss rule");
+      else if (b.dataset.act === "review") await send(SEL.review + word(id), CFG.guard, "review");
       else if (b.dataset.act === "netexit") await send(SEL.setNetExit + word(id) + word(NET_EXIT_BPS), CFG.guard, "exit rule");
       else if (b.dataset.act === "move") {
         const g = words(await call(CFG.guard, SEL.guarded + word(id)));
@@ -353,9 +448,9 @@ a{color:var(--blue)}
       }
       else await send(SEL.close + word(id), CFG.guard, "close");
       await refresh();
-    } catch (err) { alertless(err); } finally { st.busy = false; b.disabled = false; }
+    } catch (err) { alertless(err, "st-mine"); refresh(); } finally { st.busy = false; b.disabled = false; }
   });
-  function alertless(err) { status("st-open", esc(/rejected|denied/i.test(err.message || "") ? "Cancelled in the wallet." : err.message), true); }
+  function alertless(err, where = "st-open") { status(where, esc(/rejected|denied/i.test(err.message || "") ? "Cancelled in the wallet." : err.message), true); }
 
   el("go").addEventListener("click", async () => {
     if (st.busy) return;
