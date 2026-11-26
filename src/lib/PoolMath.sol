@@ -61,7 +61,8 @@ library PoolMath {
     ///         keeping the previous one so `payRate` always has a full window to measure over.
     function markPay(PayMark storage m, address pool) public {
         if (m.readAt != 0 && block.timestamp - m.readAt < MIN_PAY_WINDOW) return;
-        uint256 growth = rewardGrowth(pool);
+        (uint256 growth, bool ok) = readGrowth(pool);
+        if (!ok) return; // a counter without its unsettled part would read as too little pay
         if (growth < m.growth) growth = m.growth; // a failed voter read never moves the mark back
         m.prevGrowth = m.growth;
         m.prevReadAt = m.readAt;
@@ -131,7 +132,8 @@ library PoolMath {
             ? (m.growth, m.readAt)
             : (m.prevGrowth, m.prevReadAt);
         if (since == 0) return 0;
-        uint256 current = rewardGrowth(pool);
+        (uint256 current, bool ok) = readGrowth(pool);
+        if (!ok) return 0;
         uint256 grown = current > base ? current - base : 0;
         uint256 perValue = grown.mulDiv(1e18, valuePerLiquidity(pool, halfWidth, sugar)).mulDiv(Q96, 2 ** 128);
         return perValue / (block.timestamp - since);
@@ -180,7 +182,7 @@ library PoolMath {
 
     /// @notice Whether a pool's pay and its price swings have both been measured.
     function measured(PayMark storage m, SnapLog storage l) public view returns (bool) {
-        return paySince(m) != 0 && priceVariance(l) != 0;
+        return paySince(m) != 0 && l.count >= 3;
     }
 
     /// @notice Pay (AERO priced in token1) minus expected loss to swings, per second, share of value 1e18.
@@ -243,12 +245,18 @@ library PoolMath {
     ///         (checked on Base 16.11.2026: ~3.9 AERO over 12 s on AERO/WETH CL200). If any of these
     ///         reads fails, the counter is taken as it stands rather than failing the review.
     function rewardGrowth(address pool) public view returns (uint256 growth) {
+        (growth,) = readGrowth(pool);
+    }
+
+    /// @notice `rewardGrowth`, and whether the unsettled part could be read (false: the counter alone,
+    ///         which may sit below what the pool has really paid; such a reading is never used for pay).
+    function readGrowth(address pool) public view returns (uint256 growth, bool ok) {
         ICLPool p = ICLPool(pool);
         growth = p.rewardGrowthGlobalX128();
         uint256 staked = p.stakedLiquidity();
-        if (staked == 0 || p.lastUpdated() == block.timestamp) return growth;
+        if (staked == 0 || p.lastUpdated() == block.timestamp) return (growth, true);
         address gauge = p.gauge();
-        if (gauge == address(0)) return growth;
+        if (gauge == address(0)) return (growth, true);
         try ICLGauge(gauge).voter() returns (address voter) {
             try ILeafVoter(voter).projectedCumulativeRewardShare(gauge) returns (uint256 projected) {
                 try ICLGauge(gauge).lastCumulativeRewardShare() returns (uint256 settled) {
@@ -257,6 +265,7 @@ library PoolMath {
                             growth += (projected - settled).mulDiv(2 ** 128, staked); // the counter may wrap, like the pool's
                         }
                     }
+                    ok = true;
                 } catch {}
             } catch {}
         } catch {}

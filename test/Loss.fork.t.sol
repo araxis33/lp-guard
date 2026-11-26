@@ -4,6 +4,8 @@ pragma solidity ^0.8.29;
 import {Test, console2} from "forge-std/Test.sol";
 import {PoolMath} from "../src/lib/PoolMath.sol";
 import {PositionGuard} from "../src/PositionGuard.sol";
+import {IGuard, GuardDeploy} from "./GuardAll.sol";
+import {GuardCore} from "../src/GuardCore.sol";
 import {GuardMeter} from "../src/GuardMeter.sol";
 import {Swapper} from "./Review.fork.t.sol";
 
@@ -15,12 +17,12 @@ contract LossForkTest is Test {
     address constant POOL = 0xc85D5CB72d1aaD6f152A8decAd228AE4A59Ac9B3; // AERO/WETH CL200
     address constant SUGAR = 0x0AD09A66af0154a84e86F761313d02d0abB6edd5;
 
-    PositionGuard guard;
+    IGuard guard;
     uint256 t; // our own clock: block.timestamp after vm.warp can be stale under via-IR
 
     function setUp() public {
         vm.createSelectFork(vm.envOr("BASE_RPC_URL", string("https://base-rpc.publicnode.com")), 56_197_000);
-        guard = new PositionGuard(NPM, AERO, makeAddr("proxy"), makeAddr("reactive"), SUGAR);
+        guard = GuardDeploy.deploy(NPM, AERO, makeAddr("proxy"), makeAddr("reactive"), SUGAR);
         t = vm.getBlockTimestamp();
     }
 

@@ -3,6 +3,8 @@ pragma solidity ^0.8.29;
 
 import {Test, console2} from "forge-std/Test.sol";
 import {PositionGuard} from "../src/PositionGuard.sol";
+import {IGuard, GuardDeploy} from "./GuardAll.sol";
+import {GuardCore} from "../src/GuardCore.sol";
 import {GuardMeter} from "../src/GuardMeter.sol";
 import {stdStorage, StdStorage} from "forge-std/Test.sol";
 
@@ -24,11 +26,11 @@ contract PriceForkTest is Test {
     address constant WETH_USDC = 0x4A7af46bC8aBc00048c6c7920a1488DAF568366c; // WETH token0, USDC token1
     address constant WETH_USDC_100 = 0x2A430bEbD2082d8e05D56d64DEDE8944279bbC24; // same pair, no AERO
 
-    PositionGuard guard;
+    IGuard guard;
 
     function setUp() public {
         vm.createSelectFork(vm.envOr("BASE_RPC_URL", string("https://base-rpc.publicnode.com")), 56_197_000);
-        guard = new PositionGuard(NPM, AERO, makeAddr("proxy"), makeAddr("reactive"), SUGAR);
+        guard = GuardDeploy.deploy(NPM, AERO, makeAddr("proxy"), makeAddr("reactive"), SUGAR);
     }
 
     function test_aeroPrice_inAnAeroPool() public view {
@@ -54,13 +56,13 @@ contract PriceForkTest is Test {
 
     function test_aeroPrice_rejectsAPoolWithoutAero() public {
         GuardMeter m = guard.meter();
-        vm.expectRevert(PositionGuard.BadPricePool.selector);
+        vm.expectRevert(GuardCore.BadPricePool.selector);
         m.aeroPrice(WETH_USDC, WETH_USDC_100);
     }
 
     function test_setPricePool_ownerOnly() public {
         vm.prank(makeAddr("stranger"));
-        vm.expectRevert(PositionGuard.NotOwner.selector);
+        vm.expectRevert(GuardCore.NotOwner.selector);
         guard.setPricePool(1, AERO_WETH);
     }
 
@@ -107,7 +109,7 @@ contract PriceForkTest is Test {
         IERC20Approve(WETH).approve(address(guard), type(uint256).max);
         IERC20Approve(USDC).approve(address(guard), type(uint256).max);
         id = guard.open(
-            PositionGuard.OpenParams({
+            GuardCore.OpenParams({
                 pool: WETH_USDC,
                 amount0: 1e18,
                 amount1: 5_000e6,
@@ -116,7 +118,10 @@ contract PriceForkTest is Test {
                 amount1Min: 0,
                 stake: true,
                 graceSeconds: 0,
-                maxLossBps: 0
+                maxLossBps: 0,
+                alternates: new address[](0),
+                pricePool: address(0),
+                reenter: false
             })
         );
         vm.stopPrank();

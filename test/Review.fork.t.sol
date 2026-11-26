@@ -3,6 +3,8 @@ pragma solidity ^0.8.29;
 
 import {Test, Vm, console2} from "forge-std/Test.sol";
 import {PositionGuard} from "../src/PositionGuard.sol";
+import {IGuard, GuardDeploy} from "./GuardAll.sol";
+import {GuardCore} from "../src/GuardCore.sol";
 import {INonfungiblePositionManager, ICLPool, IERC20} from "../src/interfaces/IAero.sol";
 
 interface IERC20Approve {
@@ -17,7 +19,7 @@ contract ReviewForkTest is Test {
     address constant POOL = 0xc85D5CB72d1aaD6f152A8decAd228AE4A59Ac9B3; // AERO/WETH CL200
     address constant SUGAR = 0x0AD09A66af0154a84e86F761313d02d0abB6edd5; // Aero SugarHelper
 
-    PositionGuard guard;
+    IGuard guard;
     address user = makeAddr("user");
     address proxy = makeAddr("callbackProxy");
     address reactive = makeAddr("reactiveContract");
@@ -25,7 +27,7 @@ contract ReviewForkTest is Test {
 
     function setUp() public {
         vm.createSelectFork(vm.envOr("BASE_RPC_URL", string("https://base-rpc.publicnode.com")), 56_197_000);
-        guard = new PositionGuard(NPM, AERO, proxy, reactive, SUGAR);
+        guard = GuardDeploy.deploy(NPM, AERO, proxy, reactive, SUGAR);
     }
 
     function _slot0() internal view returns (uint160 sqrtP, int24 tick) {
@@ -34,8 +36,8 @@ contract ReviewForkTest is Test {
         (sqrtP, tick) = abi.decode(ret, (uint160, int24));
     }
 
-    function _openParams(uint256 a0, uint256 a1) internal pure returns (PositionGuard.OpenParams memory) {
-        return PositionGuard.OpenParams({
+    function _openParams(uint256 a0, uint256 a1) internal pure returns (GuardCore.OpenParams memory) {
+        return GuardCore.OpenParams({
             pool: POOL,
             amount0: a0,
             amount1: a1,
@@ -44,7 +46,10 @@ contract ReviewForkTest is Test {
             amount1Min: 0,
             stake: true,
             graceSeconds: 3 hours,
-            maxLossBps: 0
+            maxLossBps: 0,
+            alternates: new address[](0),
+            pricePool: address(0),
+            reenter: false
         });
     }
     // ---- daily review: position against simply holding ----
@@ -54,7 +59,7 @@ contract ReviewForkTest is Test {
     function _openWithLimit(uint16 maxLossBps) internal returns (uint256 id) {
         deal(AERO, user, 1_000e18);
         deal(WETH, user, 1e18);
-        PositionGuard.OpenParams memory p = _openParams(1_000e18, 1e18);
+        GuardCore.OpenParams memory p = _openParams(1_000e18, 1e18);
         p.maxLossBps = maxLossBps;
         vm.startPrank(user);
         IERC20Approve(AERO).approve(address(guard), type(uint256).max);
@@ -195,17 +200,17 @@ contract ReviewForkTest is Test {
     function test_setMaxLoss_ownerOnly_andBounded() public {
         uint256 id = _openWithLimit(0);
         vm.prank(stranger);
-        vm.expectRevert(PositionGuard.NotOwner.selector);
+        vm.expectRevert(GuardCore.NotOwner.selector);
         guard.setMaxLoss(id, 100);
         vm.prank(user);
-        vm.expectRevert(PositionGuard.BadLimit.selector);
+        vm.expectRevert(GuardCore.BadLimit.selector);
         guard.setMaxLoss(id, 10_000);
         vm.prank(user);
         guard.setMaxLoss(id, 100);
         (,,, uint16 limit,,,) = guard.guarded(id);
         assertEq(limit, 100);
         vm.prank(stranger);
-        vm.expectRevert(PositionGuard.NotOwner.selector);
+        vm.expectRevert(GuardCore.NotOwner.selector);
         guard.review(id);
     }
 
@@ -241,7 +246,7 @@ contract ReviewForkTest is Test {
 
         uint256 wethBefore = IERC20(WETH).balanceOf(user);
         vm.expectEmit(true, false, false, false, address(guard));
-        emit PositionGuard.NetExitDue(id, 0);
+        emit GuardCore.NetExitDue(id, 0);
         vm.prank(user);
         guard.review(id);
         (address owner,,,,,,) = guard.guarded(id);
@@ -282,7 +287,7 @@ contract ReviewForkTest is Test {
     function test_netExit_unstakedPosition_isNeverMeasured_andReviewWorks() public {
         deal(AERO, user, 1_000e18);
         deal(WETH, user, 1e18);
-        PositionGuard.OpenParams memory p = _openParams(1_000e18, 1e18);
+        GuardCore.OpenParams memory p = _openParams(1_000e18, 1e18);
         p.stake = false; // earns fees, not AERO
         vm.startPrank(user);
         IERC20Approve(AERO).approve(address(guard), type(uint256).max);
@@ -324,10 +329,10 @@ contract ReviewForkTest is Test {
     function test_setNetExit_ownerOnly_andBounded() public {
         uint256 id = _openWithLimit(0);
         vm.prank(stranger);
-        vm.expectRevert(PositionGuard.NotOwner.selector);
+        vm.expectRevert(GuardCore.NotOwner.selector);
         guard.setNetExit(id, 10);
         vm.prank(user);
-        vm.expectRevert(PositionGuard.BadLimit.selector);
+        vm.expectRevert(GuardCore.BadLimit.selector);
         guard.setNetExit(id, 10_000);
         vm.prank(user);
         guard.setNetExit(id, 10);
