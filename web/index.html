@@ -310,7 +310,12 @@ a{color:var(--blue)}
     for (const s of inWallet) {
       const id = BigInt(s);
       if (out.some((p) => p.id === id)) continue;
-      try { if ((await ownerOf(id)) === st.account.toLowerCase()) out.push({ id, pool: null, where: "wallet" }); } catch (e) {}
+      try {
+        if ((await ownerOf(id)) !== st.account.toLowerCase()) continue;
+        // an emptied position (the guard closed it and gave back the NFT) has nothing to move
+        if (big(words(await call(NPM, "0x99fbab88" + word(id)))[7]) === 0n) continue;
+        out.push({ id, pool: null, where: "wallet" });
+      } catch (e) {}
     }
     return out;
   }
