@@ -57,6 +57,7 @@ contract PositionGuard is GuardCore {
     /// @notice Review one position now, without waiting for the daily run. Owner only.
     function review(uint256 tokenId) external lock {
         if (_guarded[tokenId].owner != msg.sender && _parked[tokenId].owner != msg.sender) revert NotOwner();
+        _swapRoom(tokenId);
         _review(tokenId);
     }
 
@@ -350,7 +351,14 @@ contract PositionGuard is GuardCore {
         Guarded memory g = _guarded[tokenId];
         if (g.owner == address(0)) revert NotGuarded();
         if (msg.sender != g.owner) revert NotOwner();
+        _swapRoom(tokenId);
         _closeOut(tokenId, g);
+    }
+
+    /// @dev A wallet estimates the least gas a call succeeds with, and a close succeeds without its exit
+    ///      swap too: so an owner's call that may close asks for room for the swap up front.
+    function _swapRoom(uint256 tokenId) internal view {
+        if (_exitToken[tokenId] != address(0) && gasleft() < 2_500_000) revert BadLimit();
     }
 
     /// @dev Called by the guard on itself during a close: swaps `amountIn` in `pool` into the other token,

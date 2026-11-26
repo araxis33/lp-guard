@@ -94,9 +94,9 @@ abstract contract GuardCore is AbstractCallback {
     /// @notice Most positions one hourly check goes through, so it fits in one callback.
     uint256 public constant MAX_CHECK = 2;
     /// @notice Gas each position may use in the hourly check. A close that also swaps into the exit
-    ///         token takes ~1.3-1.5M (fork, 26.11): 2M leaves the swap room. A plain check is ~0.2M, so two
+    ///         token takes ~1.3-1.5M (fork, 26.11), and the swap gets up to 1M for Aero pool hooks: 2.6M. A plain check is ~0.2M, so two
     ///         fit the Reactive CHECK_GAS of 3M; after a close the next position waits for the next hour.
-    uint256 public constant GAS_PER_CHECK = 2_000_000;
+    uint256 public constant GAS_PER_CHECK = 2_600_000;
     uint256 internal checkCursor;
 
     /// @notice The hourly check saw the price leave a position's range (30-minute average tick).
@@ -154,7 +154,7 @@ abstract contract GuardCore is AbstractCallback {
     /// @notice The exit swap into the exit token failed (price being pushed): the two tokens were kept.
     event ExitSwapFailed(uint256 indexed id);
     /// @dev Gas for the exit swap into the exit token.
-    uint256 internal constant SWAP_GAS = 500_000;
+    uint256 internal constant SWAP_GAS = 1_000_000; // Aero pool hooks refuse a swap with too little gas left ("IG"), 26.11
 
     /// @notice The guard closed a position by itself and kept its coins for the owner.
     event Parked(uint256 indexed id, address indexed owner, uint256 amount0, uint256 amount1);

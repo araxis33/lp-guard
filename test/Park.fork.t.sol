@@ -35,7 +35,10 @@ contract ParkForkTest is Test {
     uint256 clock;
 
     function setUp() public {
-        vm.createSelectFork(vm.envOr("BASE_RPC_URL", string("https://base-rpc.publicnode.com")), 56_197_000);
+        vm.createSelectFork(
+            vm.envOr("BASE_RPC_URL", string("https://base-rpc.publicnode.com")),
+            vm.envOr("FORK_BLOCK", uint256(56_197_000))
+        );
         guard = GuardDeploy.deploy(NPM, AERO, proxy, reactive, SUGAR);
         meter = guard.meter();
         clock = vm.getBlockTimestamp();
@@ -603,6 +606,7 @@ contract ParkForkTest is Test {
     }
 
     /// Codex 26.11 (3): a swap that stops at the price limit with part unsold is a failed exit swap,
+    /// (the 420 WETH push is sized for the pinned fork block; at another block the pool depth differs)
     /// reported as such, and the owner gets both coins as they came out.
     function test_exitToken_partialSwap_isAFailure_bothCoinsToOwner() public {
         GuardCore.OpenParams memory p = _usdcExit(20, false);
