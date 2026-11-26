@@ -153,6 +153,8 @@ abstract contract GuardCore is AbstractCallback {
     mapping(uint256 id => address) internal _exitToken;
     /// @notice The exit swap into the exit token failed (price being pushed): the two tokens were kept.
     event ExitSwapFailed(uint256 indexed id);
+    /// @dev Gas for the exit swap into the exit token.
+    uint256 internal constant SWAP_GAS = 500_000;
 
     /// @notice The guard closed a position by itself and kept its coins for the owner.
     event Parked(uint256 indexed id, address indexed owner, uint256 amount0, uint256 amount1);
@@ -309,6 +311,8 @@ abstract contract GuardCore is AbstractCallback {
     /// @dev Closes and pays the owner, in the exit token when the position has one.
     function _closeOut(uint256 tokenId, Guarded memory g) internal {
         address safe = _exitToken[tokenId];
+        // no exit token: straight to the owner, as before (Codex 26.11)
+        if (safe == address(0)) return _close(tokenId, g, g.owner);
         delete _guarded[tokenId];
         (,, address t0, address t1,,,,,,,,) = npm.positions(tokenId);
         _forget(tokenId);
@@ -329,8 +333,10 @@ abstract contract GuardCore is AbstractCallback {
         _empty(tokenId, g, g.owner, address(this));
         if (safe == t0 || safe == t1) {
             uint256 x = safe == t1 ? IERC20(t0).balanceOf(address(this)) - a0 : IERC20(t1).balanceOf(address(this)) - a1;
-            if (x > 0) {
-                try ISwapOut(address(this)).swapOut(g.pool, safe == t1, x) {}
+            // capped, and only with room left after it to park or pay out, so a swap that runs
+            // out of gas can never undo the close (Codex 26.11)
+            if (x > 0 && gasleft() > SWAP_GAS + 400_000) {
+                try ISwapOut(address(this)).swapOut{gas: SWAP_GAS}(g.pool, safe == t1, x) {}
                 catch {
                     emit ExitSwapFailed(tokenId);
                 }

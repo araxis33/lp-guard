@@ -357,31 +357,23 @@ contract PositionGuard is GuardCore {
     ///      valued at the 30-minute average: at most MAX_SPOT_DEVIATION past it and at least 98% of its value.
     function swapOut(address pool, bool zeroForOne, uint256 amountIn) external {
         if (msg.sender != address(this)) revert NotOwner();
-        address t0 = ICLPool(pool).token0();
-        address t1 = ICLPool(pool).token1();
+        address tIn = zeroForOne ? ICLPool(pool).token0() : ICLPool(pool).token1();
+        address tOut = zeroForOne ? ICLPool(pool).token1() : ICLPool(pool).token0();
         int24 avg = _twapTick(pool);
         uint160 sp = sugar.getSqrtRatioAtTick(avg);
-        if (zeroForOne) {
-            _swap(
-                pool,
-                true,
-                t0,
-                t1,
-                amountIn,
-                _in1(amountIn, sp) * 98 / 100,
-                sugar.getSqrtRatioAtTick(avg - MAX_SPOT_DEVIATION)
-            );
-        } else {
-            _swap(
-                pool,
-                false,
-                t1,
-                t0,
-                amountIn,
-                MulDiv.mulDiv(MulDiv.mulDiv(amountIn, Q96, sp), Q96, sp) * 98 / 100,
-                sugar.getSqrtRatioAtTick(avg + MAX_SPOT_DEVIATION)
-            );
-        }
+        uint256 fair = zeroForOne ? _in1(amountIn, sp) : MulDiv.mulDiv(MulDiv.mulDiv(amountIn, Q96, sp), Q96, sp);
+        uint256 before = IERC20(tIn).balanceOf(address(this));
+        _swap(
+            pool,
+            zeroForOne,
+            tIn,
+            tOut,
+            amountIn,
+            fair * 98 / 100,
+            sugar.getSqrtRatioAtTick(zeroForOne ? avg - MAX_SPOT_DEVIATION : avg + MAX_SPOT_DEVIATION)
+        );
+        // stopped at the price limit with part unsold: not an exit into the exit token (Codex 26.11)
+        if (before - IERC20(tIn).balanceOf(address(this)) < amountIn) revert TooLittleReceived();
     }
 
     /// @notice AERO the position has earned in the gauge and not yet claimed.

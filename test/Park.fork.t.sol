@@ -601,6 +601,26 @@ contract ParkForkTest is Test {
         guard.open(p);
         vm.stopPrank();
     }
+
+    /// Codex 26.11 (3): a swap that stops at the price limit with part unsold is a failed exit swap,
+    /// reported as such, and the owner gets both coins as they came out.
+    function test_exitToken_partialSwap_isAFailure_bothCoinsToOwner() public {
+        GuardCore.OpenParams memory p = _usdcExit(20, false);
+        p.amount0 = 100e18;
+        p.amount1 = 300_000e6;
+        uint256 id = _openAs(user, p);
+        Seller s = new Seller();
+        deal(WETH, address(s), 420e18);
+        s.sell(CL50, WETH); // ~90 ticks below the 30-minute average: the limit is 10 ticks away
+        uint256 w0 = IERC20(WETH).balanceOf(user);
+        vm.expectEmit(true, false, false, false, address(guard));
+        emit GuardCore.ExitSwapFailed(id);
+        vm.prank(user);
+        guard.close(id);
+        assertGt(IERC20(WETH).balanceOf(user), w0, "WETH as it came out");
+        assertEq(IERC20(WETH).balanceOf(address(guard)), 0);
+        assertEq(IERC20(USDC).balanceOf(address(guard)), 0);
+    }
 }
 
 /// Sells WETH (token0 of WETH/USDC) into a pool to push its price down.
