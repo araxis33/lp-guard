@@ -54,11 +54,13 @@ a{color:var(--blue)}
       <button id="go">Connect wallet</button>
     </div>
     <ul class="rules">
-      <li>Range: current price ± 5 steps of the pool. Stays staked, so it earns AERO.</li>
+      <li>The guard opens in the pool of this pair that has paid most net of price swings (it measures them hourly) and swaps half your USDC there. Range: current price ± 5 steps. Stays staked, so it earns AERO.</li>
       <li>Reviewed once a day: AERO goes to your wallet, then the position is compared with just holding what you put in.</li>
       <li>Closed for you if it falls more than <b id="r-loss">3%</b> behind holding, or sits out of range for <b id="r-grace">3 hours</b>.</li>
       <li>Also closed when the pool stops paying: its AERO is worth less than what price swings cost by more than <b id="r-net">0.10%</b> a day (measured after 12 hours).</li>
-      <li>You can close or take it back yourself at any time. Nobody else can move it.</li>
+      <li>On every close the guard tries to turn everything into USDC, so a falling coin is not held after the exit: the other coin is swapped in the same pool, at most 2% below the 30-minute average price. If that swap cannot be done at that moment, you get both coins as they came out.</li>
+      <li>When the guard closes it by itself, the coins wait on the guard for you and go back into the pool that pays once one earns over <b>0.10%</b> a day net of swings, at two daily reviews 20 hours apart.</li>
+      <li>You can close it, take the position back as it is, or take parked coins back at any time. Nobody else can move them.</li>
     </ul>
     <div id="st-open" class="status"></div>
   </section>
@@ -76,9 +78,9 @@ a{color:var(--blue)}
   const q = new URLSearchParams(location.search);
   // The guard you approve USDC to is fixed here. Only a page opened from this computer
   // (localhost) may point at a local fork, so a crafted link cannot swap in another spender.
-  const LIVE_GUARD = "0x426B54428325Cc674a7f97D435CB0Dff160C01Dd";
+  const LIVE_GUARD = "0x6D8515f34F020b5D274B5B08b2322Ae41E0b5E85";
   // Earlier versions of the guard: positions still in them can be moved into the current one as they are.
-  const OLD_GUARDS = ["0x249f0A7145Fa806F64DdeE142b7F8453152b2f15"];
+  const OLD_GUARDS = ["0x426B54428325Cc674a7f97D435CB0Dff160C01Dd", "0x249f0A7145Fa806F64DdeE142b7F8453152b2f15"];
   const NPM = "0x4857DB576eE0e45F10525eC59527BfD10beeC60b"; // Aero Slipstream position NFTs
   const LOCAL = location.hostname === "127.0.0.1" || location.hostname === "localhost";
   const CFG = {
@@ -95,8 +97,9 @@ a{color:var(--blue)}
   const POOLS = [
     ["0x4A7af46bC8aBc00048c6c7920a1488DAF568366c", "WETH / USDC · Aero CL50"],
     ["0xD0Acf293547457Fb4fE9eE32CA93e89497626816", "AERO / USDC · Aero CL200"],
-    ["0xc85D5CB72d1aaD6f152A8decAd228AE4A59Ac9B3", "AERO / WETH · Aero CL200"],
   ];
+  const ZERO = "0x0000000000000000000000000000000000000000";
+  const MAX_LISTED = 4; // places on the guard (positions and parked coins), so the daily run reaches each
   // Other pools of the same two tokens, with a gauge, that a position may move into when they pay more
   const ALTS = {
     "0x4a7af46bc8abc00048c6c7920a1488daf568366c": [["0x2A430bEbD2082d8e05D56d64DEDE8944279bbC24", "WETH / USDC · Aero CL100"]],
@@ -104,7 +107,8 @@ a{color:var(--blue)}
   };
   const HALF_WIDTH = 5, MAX_LOSS_BPS = 300, GRACE = 3 * 3600, SWAP_FLOOR_BPS = 9900; // 1% worst price on the swaps in
   const MIN_USDC = 1;
-  const NET_EXIT_BPS = 10; // leave when the pool pays less than its price swings cost, by more than 0.10% a day
+  const NET_EXIT_BPS = 10;
+  const REENTER_BPS = 10; // the guard's REENTER_FLOOR: back in when a pool earns over 0.10% a day net of swings // leave when the pool pays less than its price swings cost, by more than 0.10% a day
   const DEPOSITED = "0x7896c404bfb9173f4c61824c5e10e743eb885c3fe1c1727ed55ac3a51a350874";
   // A pool of AERO and one of the position's tokens, so a pool without AERO still counts the AERO it pays
   const AERO_PRICE_VIA = { [WETH.toLowerCase()]: "0xc85D5CB72d1aaD6f152A8decAd228AE4A59Ac9B3", [USDC.toLowerCase()]: "0xD0Acf293547457Fb4fE9eE32CA93e89497626816" };
@@ -113,6 +117,7 @@ a{color:var(--blue)}
     openWith: "0x8ea9db67", standing: "0xe73f3e5d", netPerDay: "0x39dad9b0", guarded: "0x5e284975", review: "0xe1e96c9b", close: "0x0aebeb4e",
     pendingAero: "0xee2beb63", reviewList: "0x3c01ec2b", reviewCount: "0xeff5924f", setPricePool: "0xb036f298", setNetExit: "0x4eac38d5", pricePool: "0x3a25d732", netExitBps: "0x62eff892",
     setAlternates: "0xfd68fff5", alternatesOf: "0x1e0b8430",
+    open: "0xb8bd9ee7", parked: "0x994e7296", takeParked: "0xde9f4e70", setReenter: "0x82542bda", reenterOn: "0x59dc2451",
     deposit: "0x7b6f6669", withdraw: "0x2e1a7d4d", getApproved: "0x081812fc", ownerOf: "0x6352211e", setMaxLoss: "0x17100711", tokenOfOwnerByIndex: "0x2f745c59",
   };
   const st = { account: null, busy: false };
@@ -219,53 +224,34 @@ a{color:var(--blue)}
     const pool = el("pool").value;
     const bal = big(words(await call(USDC, SEL.balanceOf + addr(st.account)))[0]);
     if (bal < amount) throw new Error("Your wallet has " + fmt(bal, 6, 2) + " USDC.");
+    if (Number(big(words(await call(CFG.guard, SEL.reviewCount))[0])) >= MAX_LISTED) throw new Error("The guard is full: it keeps " + MAX_LISTED + " positions at most. Try later.");
     const info = await poolInfo(pool);
-    // Half the USDC goes to each side of a centred range; what does not fit comes back to you.
-    const legs = [];
-    let swapped = 0n;
-    for (const tok of [info.token0, info.token1]) {
-      if (tok.toLowerCase() === USDC.toLowerCase()) { legs.push([ "0x0000000000000000000000000000000000000000", 0n, 0n ]); continue; }
-      const route = USDC_ROUTE[tok.toLowerCase()];
-      const share = amount / 2n;
-      // Aero pools charge their own (sometimes dynamic) fee, e.g. 1.05% on USDC/AERO: the 1% floor is on top of it
-      const fee = big(words(await call(route, SEL.fee))[0]); // in millionths
-      const out = atPrice(await poolInfo(route), USDC, share) * (1000000n - fee) / 1000000n;
-      legs.push([route, share, out * BigInt(SWAP_FLOOR_BPS) / 10000n]);
-      swapped += share;
-    }
-    if (swapped > amount) throw new Error("Bad split.");
+    const usdc0 = info.token0.toLowerCase() === USDC.toLowerCase();
     const allowance = big(words(await call(USDC, SEL.allowance + addr(st.account) + addr(CFG.guard)))[0]);
     if (allowance < amount) {
-      status("st-open", "Step 1: approve " + fmt(amount, 6, 2) + " USDC in your wallet…");
+      status("st-open", "Step 1 of 3: approve " + fmt(amount, 6, 2) + " USDC in your wallet…");
       await send(SEL.approve + addr(CFG.guard) + word(amount), USDC, "approval");
     }
-    const hasAero = [info.token0, info.token1].some((t) => t.toLowerCase() === AERO.toLowerCase());
     const alts = ALTS[pool.toLowerCase()] || [];
-    const total = (hasAero ? 3 : 4) + (alts.length ? 1 : 0);
-    status("st-open", "Step 2 of " + total + ": put it in. Confirm in your wallet…");
-    const leg = (l) => addr(l[0]) + word(l[1]) + word(l[2]);
-    const params = addr(pool) + word(0) + word(0) + word(HALF_WIDTH) + word(0) + word(0) + word(1) + word(GRACE) + word(MAX_LOSS_BPS);
-    const r = await send(SEL.openWith + addr(USDC) + word(amount) + leg(legs[0]) + leg(legs[1]) + params, CFG.guard, "deposit");
+    const hasAero = [info.token0, info.token1].some((t) => t.toLowerCase() === AERO.toLowerCase());
+    const via = hasAero ? ZERO : (AERO_PRICE_VIA[info.token1.toLowerCase()] || AERO_PRICE_VIA[info.token0.toLowerCase()]);
+    status("st-open", "Step 2 of 3: put it in. The guard picks the pool of this pair that pays most, swaps half the USDC there and opens the position. Confirm in your wallet…");
+    // open(OpenParams): a tuple with a dynamic member sits behind an offset; inside it the alternates
+    // list sits behind its own offset, counted from the tuple's start (13 head words); the last head
+    // word is the exit token: everything comes out in USDC on a close
+    const head = addr(pool) + word(usdc0 ? amount : 0n) + word(usdc0 ? 0n : amount) + word(HALF_WIDTH) + word(0) + word(0) +
+      word(1) + word(GRACE) + word(MAX_LOSS_BPS) + word(13 * 32) + addr(via) + word(1) + addr(USDC);
+    const tail = word(alts.length) + alts.map((x) => addr(x[0])).join("");
+    const r = await send(SEL.open + word(32) + head + tail, CFG.guard, "deposit");
     const log = r.logs.find((l) => l.address.toLowerCase() === CFG.guard.toLowerCase() && l.topics[0] === DEPOSITED);
     if (!log) throw new Error("Deposited, but the position number was not found in the receipt. Reload the page.");
     const id = BigInt(log.topics[1]);
     try {
-    if (!hasAero) {
-      const via = AERO_PRICE_VIA[info.token1.toLowerCase()] || AERO_PRICE_VIA[info.token0.toLowerCase()];
-      if (via) {
-        status("st-open", "Step 3 of 4: let the guard count the AERO this pool pays. Confirm in your wallet…");
-        await send(SEL.setPricePool + word(id) + addr(via), CFG.guard, "AERO pricing");
-      }
-    }
-    status("st-open", "Step " + (total - (alts.length ? 1 : 0)) + " of " + total + ": switch on the exit for when the pool stops paying. Confirm in your wallet…");
-    await send(SEL.setNetExit + word(id) + word(NET_EXIT_BPS), CFG.guard, "exit rule");
-    if (alts.length) {
-      status("st-open", "Step " + total + " of " + total + ": let the guard move it into " + esc(alts.map((a) => a[1]).join(", ")) + " when that pool pays more. Confirm in your wallet…");
-      await send(altsCall(id, alts), CFG.guard, "moving");
-    }
+      status("st-open", "Step 3 of 3: switch on the exit for when the pool stops paying. Confirm in your wallet…");
+      await send(SEL.setNetExit + word(id) + word(NET_EXIT_BPS), CFG.guard, "exit rule");
     } catch (err) {
       refresh();
-      throw new Error("Position #" + id + " is open, but its setup is not finished (" + (/rejected|denied/i.test(err.message || "") ? "cancelled in the wallet" : err.message) + "). Finish it with the button on its card below.");
+      throw new Error("Position #" + id + " is open, but its exit rule is not on (" + (/rejected|denied/i.test(err.message || "") ? "cancelled in the wallet" : err.message) + "). Turn it on with the button on its card below.");
     }
     status("st-open", "Done. The guard holds your position now.", false, true);
     refresh();
@@ -279,7 +265,15 @@ a{color:var(--blue)}
     for (const id of new Set(ids)) {
       let g;
       try { g = words(await call(guard, SEL.guarded + word(id))); } catch (e) { continue; }
-      if (("0x" + g[0].slice(24)).toLowerCase() !== st.account.toLowerCase()) continue;
+      if (("0x" + g[0].slice(24)).toLowerCase() !== st.account.toLowerCase()) {
+        if (guard !== CFG.guard) continue;
+        // not an open position: maybe coins the guard parked for this wallet
+        let k;
+        try { k = words(await call(guard, SEL.parked + word(id))); } catch (e) { continue; }
+        if (("0x" + k[0].slice(24)).toLowerCase() !== st.account.toLowerCase()) continue;
+        out.push({ id, parked: true, at: Number(big(k[1])), t0: "0x" + k[2].slice(24), t1: "0x" + k[3].slice(24), b0: big(k[4]), b1: big(k[5]) });
+        continue;
+      }
       out.push({ id, gauge: "0x" + g[1].slice(24), pool: "0x" + g[2].slice(24), maxLoss: Number(big(g[3])), aeroPaid: big(g[6]) });
     }
     return out;
@@ -368,7 +362,20 @@ a{color:var(--blue)}
     status("st-mine", "Done. #" + id + " is in the current guard with all its rules.", false, true);
   }
 
+  async function parkedCard(k) {
+    const [s0, d0] = token(k.t0), [s1, d1] = token(k.t1);
+    const [u0, u1] = await Promise.all([inUsd(k.t0, k.b0), inUsd(k.t1, k.b1)]);
+    const since = k.at ? new Date(k.at * 1000).toLocaleString() : "";
+    return '<div class="pos"><div class="pos-head"><span>#' + k.id + " · " + esc(s0 + " / " + s1) + ' · parked</span><span class="warn">waiting for a pool that pays</span></div>' +
+      '<div class="grid"><div><b>' + fmt(k.b0, d0) + "</b><span>" + esc(s0) + "</span></div><div><b>" + fmt(k.b1, d1) + "</b><span>" + esc(s1) + "</span></div>" +
+      "<div><b>" + usd(u0 + u1) + "</b><span>worth now</span></div><div><b>" + esc(since) + "</b><span>parked since</span></div></div>" +
+      '<div class="row"><button data-act="take" data-id="' + k.id + '">Take the coins back</button>' +
+      '<span class="small dim">The guard closed this position by itself and keeps the coins for you. It puts them back into the pool of this pair that pays most once a pool earns more than its price swings cost by ' +
+      (REENTER_BPS / 100).toFixed(2) + "% a day, at two daily reviews at least 20 hours apart. You can take them back at any time.</span></div></div>";
+  }
+
   async function card(pos) {
+    if (pos.parked) return parkedCard(pos);
     const info = await poolInfo(pos.pool);
     const t1 = info.token1;
     const s = words(await call(CFG.guard, SEL.standing + word(pos.id)));
@@ -381,6 +388,7 @@ a{color:var(--blue)}
     const priced = hasAero || words(await call(CFG.guard, SEL.pricePool + word(pos.id)))[0].slice(24) !== "0".repeat(40);
     const altsSet = Number(big(words(await call(CFG.guard, SEL.alternatesOf + word(pos.id)))[1] || "0"));
     const canMove = (ALTS[pos.pool.toLowerCase()] || []).length > 0;
+    const reenter = big(words(await call(CFG.guard, SEL.reenterOn + word(pos.id)))[0]) === 1n;
     // AERO already paid is priced here directly, so the card is right even where the guard cannot price it
     const [holdU, nowU, aeroU, pendU] = await Promise.all([inUsd(t1, hold), inUsd(t1, now), inUsd(AERO, pos.aeroPaid), inUsd(AERO, pend)]);
     let vs = holdU > 0 ? ((nowU + aeroU) / holdU - 1) * 100 : 0;
@@ -395,6 +403,8 @@ a{color:var(--blue)}
       "<div>" + netTxt + "<span>pool pays minus price swings, per day</span></div></div>" +
       '<div class="row"><button class="ghost" data-act="review" data-id="' + pos.id + '">Review now</button>' +
       '<button class="ghost" data-act="close" data-id="' + pos.id + '">Close and take back</button>' +
+      '<button class="ghost" data-act="withdraw" data-id="' + pos.id + '">Take the position back as it is</button>' +
+      (reenter || !priced ? "" : '<button data-act="reenter" data-id="' + pos.id + '">Keep the coins after an automatic close</button>') +
       (pos.maxLoss ? "" : '<button data-act="maxloss" data-id="' + pos.id + '">Turn on the ' + (MAX_LOSS_BPS / 100) + "% loss rule</button>") +
       (priced ? "" : '<button data-act="price" data-id="' + pos.id + '">Count the AERO it earns</button>') +
       (netExit ? "" : '<button data-act="netexit" data-id="' + pos.id + '">Turn on exit when the pool stops paying</button>') +
@@ -404,6 +414,7 @@ a{color:var(--blue)}
         measured ? "Leaves if it loses over " + (netExit / 100).toFixed(2) + "% a day. " :
         "Exit rule set at " + (netExit / 100).toFixed(2) + "% a day; it acts once the pool has been measured (its pay over 12 hours, its swings within a few hours). ") +
       (altsSet ? "Moves to the other pool of this pair when it pays at least 0.05% a day more, two days running. " : "") +
+      (reenter ? "If the guard closes it by itself, the coins wait here and go back into the pool that pays. " : "If the guard closes it by itself, the coins go to your wallet. ") +
       "</span></div></div>";
   }
 
@@ -431,6 +442,9 @@ a{color:var(--blue)}
     try {
       if (b.dataset.act === "movein") await moveIn(id);
       else if (b.dataset.act === "maxloss") await send(SEL.setMaxLoss + word(id) + word(MAX_LOSS_BPS), CFG.guard, "loss rule");
+      else if (b.dataset.act === "take") await send(SEL.takeParked + word(id), CFG.guard, "take back");
+      else if (b.dataset.act === "withdraw") await send(SEL.withdraw + word(id), CFG.guard, "withdrawal");
+      else if (b.dataset.act === "reenter") await send(SEL.setReenter + word(id) + word(1), CFG.guard, "keep coins");
       else if (b.dataset.act === "review") await send(SEL.review + word(id), CFG.guard, "review");
       else if (b.dataset.act === "netexit") await send(SEL.setNetExit + word(id) + word(NET_EXIT_BPS), CFG.guard, "exit rule");
       else if (b.dataset.act === "move") {

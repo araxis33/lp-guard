@@ -14,12 +14,11 @@ import {MulDiv} from "./lib/MulDiv.sol";
 ///         pool earns net of the expected loss to swings, which the guard uses to leave a pool that no
 ///         longer pays and to move into a pool of the same two tokens that pays more.
 ///
-///         Only the guard that created it takes pay readings; anyone may take a price snapshot, since a
+///         Anyone may take a pay reading (at most once per 12 hours) or a price snapshot, since a
 ///         snapshot is the pool's own 30-minute average and more of them only measure over more points.
 contract GuardMeter {
     using MulDiv for uint256;
 
-    address public immutable guard;
     address public immutable npm;
     ICLFactory public immutable factory;
     address public immutable aero;
@@ -28,20 +27,21 @@ contract GuardMeter {
     mapping(address pool => PoolMath.PayMark) public payMark;
     mapping(address pool => PoolMath.SnapLog) internal snapLog;
 
-    error NotGuard();
     error UnknownPool();
 
     constructor(address npm_, address aero_, address sugar_) {
-        guard = msg.sender;
         npm = npm_;
         factory = ICLFactory(INonfungiblePositionManager(npm_).factory());
         aero = aero_;
         sugar = ISugarHelper(sugar_);
     }
 
-    /// @notice Take a new reading of the pool's reward counter (at most once per 12 hours). Guard only.
+    /// @notice Take a new reading of a real pool's reward counter (at most once per 12 hours). Anyone may:
+    ///         the previous reading is kept, so the pay is always measured over at least 12 hours, and a
+    ///         reading whose projection cannot be made is not taken (see PoolMath.markPay). This lets a pool
+    ///         be measured before anyone opens a position in it.
     function markPay(address pool) external {
-        if (msg.sender != guard) revert NotGuard();
+        _check(pool);
         PoolMath.markPay(payMark[pool], pool);
     }
 
@@ -101,9 +101,12 @@ contract GuardMeter {
         view
         returns (int256 net, bool measured_)
     {
-        if (PoolMath.paySince(payMark[pool]) == 0 || half < spacing || PoolMath.priceVariance(snapLog[pool]) == 0) {
+        if (PoolMath.paySince(payMark[pool]) == 0 || half < spacing || snapLog[pool].count < 3) {
             return (0, false);
         }
+        // pay that cannot be read now is not "no pay": nothing is decided on it (Codex 26.11)
+        (, bool ok) = PoolMath.readGrowth(pool);
+        if (!ok) return (0, false);
         // the price pool may lose its 30-minute history and revert: then this is simply not measured
         try this.aeroPrice(pool, via) returns (uint256 price) {
             if (price == 0) return (0, false);

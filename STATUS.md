@@ -2,7 +2,7 @@
 
 Every line is a promise about the guard. A line is **ON CHAIN** only with a transaction or a read from Base / Reactive mainnet that shows it. Nothing is called done from tests or from a plan.
 
-Contracts: v1.1 (live since 19 Nov) PositionGuard `0x426B54428325Cc674a7f97D435CB0Dff160C01Dd` (Base), GuardReactive `0xAC3987961BD8e05b707D984023014Af6F4260bac` (Reactive). v1.0, retired: PositionGuard `0x249f0A7145Fa806F64DdeE142b7F8453152b2f15`, GuardReactive `0x339c03A3De7d128C2b04ee54A90f5bD285fBc7e8`.
+Contracts: **v1.2 (live since 26 Nov)** PositionGuard `0x6D8515f34F020b5D274B5B08b2322Ae41E0b5E85` (Base; owner functions in GuardExt `0xc3947bD337ba350fB6393b83BA8dF3d3fC57ef39` through its fallback), GuardMeter `0xDe2F195DfBe40b903a72a6e791515079b27d93ea`, PoolMath `0x692e061A6Cc574cEf3b64bAed4F0f4F1D335d03b`; the same GuardReactive `0xAC3987961BD8e05b707D984023014Af6F4260bac` (Reactive) now calls v1.2. Retired: v1.1 PositionGuard `0x426B54428325Cc674a7f97D435CB0Dff160C01Dd` (no positions left), v1.0 PositionGuard `0x249f0A7145Fa806F64DdeE142b7F8453152b2f15`, GuardReactive `0x339c03A3De7d128C2b04ee54A90f5bD285fBc7e8`.
 
 | # | Promise | Status | Proof |
 |---|---------|--------|-------|
@@ -19,3 +19,6 @@ Contracts: v1.1 (live since 19 Nov) PositionGuard `0x426B54428325Cc674a7f97D435C
 | 11 | New pool measured within hours | v1.1 IN CODE: hourly snapshots, net rule measured after 12 h on a fork | Lifecycle.fork test |
 | 12 | REACT lasts until the submission | v1.1: timer only, ~0.04 REACT per tick, ~3.4 REACT a day; the live contract spends up to ~700 a day on swaps | measured 19.11 |
 | 13 | README + video for the Reactive submission | NOT DONE | — |
+| 14 | v1.2: open picks the pool of the pair that earned most net of swings | DEPLOYED, not exercised yet | pools measured from 26.11 (markPay + snap on CL50 and CL100) |
+| 15 | v1.2: an automatic close parks the coins in USDC; owner takes them back any time; back into a paying pool by itself | DEPLOYED, fork-tested (Park.fork, today's block), not exercised on chain yet | — |
+| 16 | v1.2: every close pays out in USDC (best effort, TWAP-bounded) | DEPLOYED; fork rehearsal on today's state: 30 USDC in, 29.79 USDC out, 0 WETH | — |

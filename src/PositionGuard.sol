@@ -1,396 +1,76 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.29;
 
-import {INonfungiblePositionManager, ICLFactory, ICLPool, ICLGauge, IERC20, ISugarHelper} from "./interfaces/IAero.sol";
+import {GuardCore} from "./GuardCore.sol";
 import {MulDiv} from "./lib/MulDiv.sol";
-import {PoolMath} from "./lib/PoolMath.sol";
-import {GuardMeter} from "./GuardMeter.sol";
-import {AbstractCallback} from "@reactive/src/base/AbstractCallback.sol";
-import {IPayable} from "@reactive/src/interfaces/IPayable.sol";
+import {ICLPool, ICLGauge, IERC20, INonfungiblePositionManager} from "./interfaces/IAero.sol";
+
+/// @dev Functions of GuardExt the guard calls on itself (they reach GuardExt through `fallback`).
+interface IExtSelf {
+    function enterParked(uint256 id, address pool) external;
+    function moveExec(uint256 tokenId, address target, int24 half) external;
+}
 
 /// @title PositionGuard
-/// @notice Holds a user's Aero (Slipstream) liquidity position, keeps it staked so it earns AERO,
-///         and can close it and send everything back to the user when told to.
+/// @notice Holds users' Aero (Slipstream) liquidity positions, keeps them staked so they earn AERO, and
+///         watches them on a clock run by a Reactive contract: hourly it keeps price snapshots and closes a
+///         position that stayed out of range; daily it compares each position with simply holding, closes
+///         one that falls behind or whose pool no longer pays for its price swings, moves one into a pool
+///         of the same pair that pays more, and puts parked coins back into a pool that pays again.
 ///
-///         Once a day it also reviews every position against simply holding: it claims the AERO
-///         earned so far and sends it to the owner, then compares what the position is worth now,
-///         plus all the AERO it has paid, with what the tokens put in would be worth if they had
-///         just been held. If the position is behind by more than the owner's limit, it is closed
-///         and everything goes back to the owner. Prices are 30-minute pool averages, so a single
-///         trade cannot push a review into a close.
+///         Owner functions (open, deposit, take back, close, settings, views) live in GuardExt and run
+///         here through `fallback` (delegatecall), on this contract's storage and balances: this contract
+///         alone would not fit the 24 KB contract size limit.
 ///
-///         Who can do what:
-///         - the position's owner: open one in a single step (`open`) or hand in an existing one
-///           (`deposit`), take it back untouched, close it, set its loss limit, review it now;
-///         - the Reactive contract (through the callback proxy): close it, or run the daily review.
-///           Everything from a close goes to the owner, so the worst it can do is close a position
-///           early. It can never take funds. Nobody else can do anything.
-contract PositionGuard is AbstractCallback {
-    using MulDiv for uint256;
+///         The Reactive contract can only start the check and the review. Everything a close pays out goes
+///         to the owner or stays parked for the owner; it can never take funds.
+contract PositionGuard is GuardCore {
+    /// @notice The extension that runs the owner functions on this contract's storage.
+    address public immutable ext;
 
-    INonfungiblePositionManager public immutable npm;
-    IERC20 public immutable aero;
-    ISugarHelper public immutable sugar;
-    /// @notice The guard's measurements of pools (pay, price swings), created with the guard.
-    GuardMeter public immutable meter;
-
-    /// @notice Length of the price average used by a review.
-    uint32 public constant TWAP_WINDOW = 30 minutes;
-    /// @notice Most positions one review call goes through, so it fits in one callback.
-    uint256 public constant MAX_REVIEW = 2;
-    /// @notice Gas each position may use in the daily review, so one costly position (for example
-    ///         one holding a token that burns gas on transfer) cannot starve the others. A close by
-    ///         the net rule measures pay, swings and the AERO price first: ~1.1M on Base (17.11),
-    ///         and a move into a better pool ~2.5M (19.11), so 2.8M each, two per run, inside the
-    ///         Reactive contract's REVIEW_GAS of 6M.
-    uint256 public constant GAS_PER_REVIEW = 2_800_000;
-    /// @notice A review closes only while the current price is within this many ticks (~1%) of the
-    ///         30-minute average; otherwise someone may be moving the price to profit from the
-    ///         close, and the close waits for the next review.
-    int24 public constant MAX_SPOT_DEVIATION = 100;
-    uint256 internal constant Q96 = 2 ** 96;
-    int24 internal constant MIN_TICK = -887272;
-    int24 internal constant MAX_TICK = 887272;
-
-    struct Guarded {
-        address owner;
-        address gauge; // zero when the position is held unstaked
-        address pool;
-        uint16 maxLossBps; // close when behind holding by more than this; 0 = never by review
-        uint128 entry0; // token0 that went into the position
-        uint128 entry1; // token1 that went into the position
-        uint256 aeroPaid; // AERO already sent to the owner by reviews
+    constructor(
+        address npm_,
+        address aero_,
+        address callbackProxy_,
+        address reactive_,
+        address sugar_,
+        address meter_,
+        address ext_
+    ) GuardCore(npm_, aero_, callbackProxy_, reactive_, sugar_, meter_) {
+        ext = ext_;
     }
 
-    mapping(uint256 tokenId => Guarded) public guarded;
-    uint256[] public reviewList;
-    uint256 internal reviewCursor; // where the next daily run starts
-    mapping(uint256 tokenId => uint256) internal reviewSlot; // index + 1; 0 = not listed
-
-    /// @notice Most other pools an owner may name for a position to move into.
-    uint256 public constant MAX_ALTERNATES = 3;
-    /// @dev Other pools of the same two tokens the owner allows this position to move into.
-    mapping(uint256 tokenId => address[]) internal alternates;
-    /// @notice For a pool without AERO in it: the pool the owner named to price AERO (AERO paired
-    ///         with one of the position's two tokens). Zero when not set.
-    mapping(uint256 tokenId => address) public pricePool;
-
-    /// @dev Per position: how long the price may stay out of range before the hourly check closes it
-    ///      (0 = never), and since when it has been out (0 = inside at the last check).
-    struct RangeWatch {
-        uint32 grace;
-        uint64 outSince;
-    }
-
-    mapping(uint256 tokenId => RangeWatch) public rangeWatch;
-    /// @notice Most positions one hourly check goes through, so it fits in one callback.
-    uint256 public constant MAX_CHECK = 2;
-    /// @notice Gas each position may use in the hourly check (the fork test measures a close).
-    uint256 public constant GAS_PER_CHECK = 1_300_000;
-    uint256 internal checkCursor;
-
-    /// @notice The hourly check saw the price leave a position's range (30-minute average tick).
-    event WentOut(uint256 indexed tokenId, int24 averageTick);
-    /// @notice The price came back into the range before the grace period ran out.
-    event CameBack(uint256 indexed tokenId, int24 averageTick);
-    /// @notice How much more an alternate pool must earn than the current one, net of swings, before
-    ///         the position moves: 5 basis points of its value a day (1e18 = 100%, per second).
-    uint256 public constant MOVE_MARGIN = uint256(5e14) / 1 days;
-    /// @dev Per position: the alternate pool the last review found better. A move happens only when
-    ///      two reviews in a row (two days) point at the same pool.
-    mapping(uint256 tokenId => address) public moveVote;
-    mapping(uint256 tokenId => uint64) internal moveVoteAt;
-    /// @notice Least time between the two reviews that must agree before a move.
-    uint64 public constant MOVE_WAIT = 20 hours;
-    /// @notice The review moved a position into a pool that earns more. Coins that did not fit the
-    ///         new range at the moment of the move went straight to the owner.
-    event Moved(uint256 indexed fromTokenId, uint256 indexed toTokenId, address indexed pool);
-
-    /// @notice A position's hourly check reverted or ran out of its gas; it is tried again next hour.
-    event CheckFailed(uint256 indexed tokenId);
-    /// @dev Gas for each alternate pool's snapshot in the hourly check.
-    uint256 internal constant SNAP_GAS = 120_000;
-
-    /// @notice Per position: the review closes it when the pool's pay minus its expected loss to
-    ///         price swings falls below minus this many basis points of its value a day. 0 = off.
-    mapping(uint256 tokenId => uint16) public netExitBps;
-    event NetExitSet(uint256 indexed tokenId, uint16 bpsPerDay);
-    /// @notice The review closed a position because its pool no longer pays for the swings.
-    ///         `netPerDay` is a share of the position's value a day, 1e18 = 100%.
-    event NetExitDue(uint256 indexed tokenId, int256 netPerDay);
-
-    event Deposited(uint256 indexed tokenId, address indexed owner, address gauge);
-    event PricePoolSet(uint256 indexed tokenId, address pricePool);
-    event Withdrawn(uint256 indexed tokenId, address indexed owner);
-    event Closed(
-        uint256 indexed tokenId,
-        address indexed owner,
-        address indexed by,
-        uint256 amount0,
-        uint256 amount1,
-        uint256 aeroPaid
-    );
-    /// @notice One review. All values are in the pool's token1 at the 30-minute average price.
-    /// @param holdValue what the tokens put in would be worth if simply held
-    /// @param positionValue what the position is worth now (its tokens plus unclaimed fees)
-    /// @param aeroValue the AERO paid to the owner so far (zero if AERO has no price in this pool)
-    event Reviewed(uint256 indexed tokenId, uint256 holdValue, uint256 positionValue, uint256 aeroValue, bool closed);
-    event MaxLossSet(uint256 indexed tokenId, uint16 maxLossBps);
-    /// @notice The review wanted to close, but the current price was too far from the average.
-    event CloseDeferred(uint256 indexed tokenId, int24 spotTick, int24 averageTick);
-    event AlternatesSet(uint256 indexed tokenId, address[] pools);
-
-    error NotOwner();
-    error NotGuarded();
-    error UnknownPool();
-    error BadWidth();
-    error BadSplit();
-    error BadSwapPool();
-    error TooLittleReceived();
-    error NotSwapPool();
-    error BadLimit();
-    error NoPriceHistory();
-    error TooManyAlternates();
-    error NotSamePair();
-    error BadPricePool();
-
-    /// @notice One swap of the payment token into one of the pool's tokens.
-    struct SwapLeg {
-        address pool; // an Aero Slipstream pool of tokenIn and the target token
-        uint256 amountIn; // how much tokenIn to swap
-        uint256 minOut; // revert if the swap gives less than this
-    }
-
-    uint160 internal constant MIN_SQRT_RATIO = 4295128739;
-    uint160 internal constant MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342;
-
-    /// @dev Set only while the guard itself takes in a position NFT (see onERC721Received).
-    uint256 internal transient nftExpected;
-
-    /// @dev The pool the guard is swapping in right now; only it may ask to be paid.
-    address internal swapPool;
-
-    // TransferFailed() comes from AbstractPayer (via AbstractCallback).
-
-    /// @notice What `open` needs. The range is placed around the pool's current price.
-    struct OpenParams {
-        address pool; // an Aero Slipstream pool; checked against the factory
-        uint256 amount0; // most of token0 to put in
-        uint256 amount1; // most of token1 to put in
-        uint16 halfWidth; // range = current price ± halfWidth tick spacings (at least 1)
-        uint256 amount0Min; // slippage guard: least token0 that must go in
-        uint256 amount1Min; // slippage guard: least token1 that must go in
-        bool stake; // stake in the gauge to earn AERO
-        uint32 graceSeconds; // automatic close after this long out of range; 0 = off
-        uint16 maxLossBps; // daily review closes when behind holding by more than this; 0 = off
-    }
-
-    /// @param callbackProxy_ Reactive's callback proxy on this chain.
-    /// @param reactive_ The Reactive contract allowed to ask for a close or a review.
-    /// @param sugar_ Aero's SugarHelper, used to value positions.
-    constructor(address npm_, address aero_, address callbackProxy_, address reactive_, address sugar_)
-        AbstractCallback(IPayable(payable(callbackProxy_)), reactive_)
-    {
-        npm = INonfungiblePositionManager(npm_);
-        aero = IERC20(aero_);
-        sugar = ISugarHelper(sugar_);
-        meter = new GuardMeter(npm_, aero_, sugar_);
-    }
-
-    // ---- owner ----
-
-    /// @notice Hand a position to the guard. The caller must own it and have approved the guard.
-    ///         The review compares against what the position holds at this moment.
-    /// @param stake true to stake it in the pool's gauge (earns AERO), false to hold it unstaked (earns fees).
-    /// @param graceSeconds how long the price must stay outside the position's range before it is
-    ///        closed automatically. Zero turns the automatic close off.
-    /// @dev Any ETH sent along stays in the guard and pays for the Reactive callback.
-    function deposit(uint256 tokenId, bool stake, uint32 graceSeconds) external payable {
-        npm.transferFrom(msg.sender, address(this), tokenId);
-        (uint160 sqrtP,,,,,) = ICLPool(_poolOf(tokenId)).slot0();
-        (uint256 a0, uint256 a1) = sugar.principal(address(npm), tokenId, sqrtP);
-        _record(tokenId, 0, a0, a1);
-        _guard(tokenId, msg.sender, stake, graceSeconds);
-    }
-
-    /// @notice One step in: take the two tokens, open a position around the current price in
-    ///         `p.pool`, stake it, and guard it for the caller. Whatever the pool did not take is
-    ///         sent straight back. The caller must have approved the guard for both amounts.
-    /// @dev Any ETH sent along stays in the guard and pays for the Reactive callback.
-    function open(OpenParams calldata p) external payable returns (uint256 tokenId) {
-        if (p.halfWidth == 0) revert BadWidth();
-        (address token0, address token1) = _poolTokens(p.pool);
-        _pull(token0, p.amount0);
-        _pull(token1, p.amount1);
-        tokenId = _mintAndGuard(p, token0, token1, p.amount0, p.amount1);
-        _refund(token0);
-        _refund(token1);
-    }
-
-    /// @notice One step in from a single token (for example USDC): part of it is swapped into the
-    ///         pool's two tokens, then the position is opened, staked and guarded as in `open`.
-    ///         Whatever is left of any of the three tokens goes straight back to the caller.
-    /// @param tokenIn the token the caller pays with; may be one of the pool's own tokens.
-    /// @param amountIn how much of it to take. The caller must have approved the guard.
-    /// @param to0 swap of `tokenIn` into the pool's token0 (skipped when `tokenIn` is token0).
-    /// @param to1 swap of `tokenIn` into the pool's token1 (skipped when `tokenIn` is token1).
-    /// @param p the position to open; `p.amount0` and `p.amount1` are ignored: everything the swaps
-    ///        produced (plus any `tokenIn` that is a pool token) is offered to the pool.
-    /// @dev The split between the two swaps and the `minOut` floors are worked out off-chain by the
-    ///      page from the pool's current price; the floors make a moved price revert, not lose money.
-    function openWith(
-        address tokenIn,
-        uint256 amountIn,
-        SwapLeg calldata to0,
-        SwapLeg calldata to1,
-        OpenParams calldata p
-    ) external payable returns (uint256 tokenId) {
-        if (p.halfWidth == 0) revert BadWidth();
-        (address token0, address token1) = _poolTokens(p.pool);
-        if (to0.amountIn + to1.amountIn > amountIn) revert BadSplit();
-        if (!IERC20(tokenIn).transferFrom(msg.sender, address(this), amountIn)) revert TransferFailed();
-
-        if (tokenIn != token0) _swap(to0.pool, tokenIn, token0, to0.amountIn, to0.minOut);
-        if (tokenIn != token1) _swap(to1.pool, tokenIn, token1, to1.amountIn, to1.minOut);
-
-        uint256 amount0 = IERC20(token0).balanceOf(address(this));
-        uint256 amount1 = IERC20(token1).balanceOf(address(this));
-        IERC20(token0).approve(address(npm), amount0);
-        IERC20(token1).approve(address(npm), amount1);
-        tokenId = _mintAndGuard(p, token0, token1, amount0, amount1);
-        _refund(token0);
-        _refund(token1);
-        if (tokenIn != token0 && tokenIn != token1) _refund(tokenIn);
-    }
-
-    /// @notice Take the position back as it is, with any AERO it earned.
-    function withdraw(uint256 tokenId) external {
-        Guarded memory g = guarded[tokenId];
-        if (g.owner != msg.sender) revert NotOwner();
-        delete guarded[tokenId];
-        delete alternates[tokenId];
-        delete netExitBps[tokenId];
-        delete rangeWatch[tokenId];
-        delete pricePool[tokenId];
-        delete moveVote[tokenId];
-        delete moveVoteAt[tokenId];
-        _unlist(tokenId);
-        _unstake(tokenId, g, g.owner);
-        npm.transferFrom(address(this), g.owner, tokenId);
-        emit Withdrawn(tokenId, g.owner);
-    }
-
-    /// @notice Set how far behind simply holding the position may fall before the daily review
-    ///         closes it, in basis points (100 = 1%). Zero: the review only reports, never closes.
-    function setMaxLoss(uint256 tokenId, uint16 maxLossBps) external {
-        Guarded storage g = guarded[tokenId];
-        if (g.owner != msg.sender) revert NotOwner();
-        if (maxLossBps >= 10_000) revert BadLimit();
-        g.maxLossBps = maxLossBps;
-        emit MaxLossSet(tokenId, maxLossBps);
-    }
-
-    /// @notice Name up to three other pools of the same two tokens (for example the same pair with a
-    ///         different price step) that this position may be moved into when they pay more.
-    ///         An empty list turns moving off.
-    function setAlternates(uint256 tokenId, address[] calldata pools) external {
-        Guarded storage g = guarded[tokenId];
-        if (g.owner != msg.sender) revert NotOwner();
-        if (pools.length > MAX_ALTERNATES) revert TooManyAlternates();
-        (address t0, address t1) = _poolTokens(g.pool);
-        for (uint256 i = 0; i < pools.length; i++) {
-            (address a0, address a1) = _poolTokens(pools[i]);
-            if (a0 != t0 || a1 != t1 || pools[i] == g.pool) revert NotSamePair();
+    /// @notice Everything else (owner functions and views) runs in GuardExt on this contract's state.
+    fallback() external payable {
+        address e = ext;
+        assembly ("memory-safe") {
+            let ptr := mload(0x40)
+            calldatacopy(ptr, 0, calldatasize())
+            let ok := delegatecall(gas(), e, ptr, calldatasize(), 0, 0)
+            returndatacopy(ptr, 0, returndatasize())
+            switch ok
+            case 0 { revert(ptr, returndatasize()) }
+            default { return(ptr, returndatasize()) }
         }
-        alternates[tokenId] = pools;
-        emit AlternatesSet(tokenId, pools);
-    }
-
-    /// @notice Name the pool that prices AERO for this position when its own pool has no AERO in it:
-    ///         a pool of AERO and one of the position's two tokens (for WETH/USDC, AERO/WETH or
-    ///         AERO/USDC). Owner only, so nobody can point the guard at a thin pool whose price is
-    ///         cheap to move. Zero turns it off.
-    function setPricePool(uint256 tokenId, address via) external {
-        Guarded storage g = guarded[tokenId];
-        if (g.owner != msg.sender) revert NotOwner();
-        if (via != address(0)) meter.aeroPrice(g.pool, via); // reverts unless it prices AERO for this pool
-        pricePool[tokenId] = via;
-        emit PricePoolSet(tokenId, via);
-    }
-
-    /// @notice Close at the review when sitting in the pool no longer pays: the AERO the pool pays
-    ///         (priced in token1) minus what the position is expected to lose to price swings
-    ///         (`netRate`) is below minus `bpsPerDay` basis points of its value a day. Owner only.
-    ///         Zero turns it off. Only staked positions earn AERO, so it only acts on those, and only
-    ///         once the pool's pay, price swings and AERO price have all been measured.
-    function setNetExit(uint256 tokenId, uint16 bpsPerDay) external {
-        Guarded storage g = guarded[tokenId];
-        if (g.owner != msg.sender) revert NotOwner();
-        if (bpsPerDay >= 10_000) revert BadLimit();
-        netExitBps[tokenId] = bpsPerDay;
-        emit NetExitSet(tokenId, bpsPerDay);
     }
 
     /// @notice Review one position now, without waiting for the daily run. Owner only.
-    function review(uint256 tokenId) external {
-        if (guarded[tokenId].owner != msg.sender) revert NotOwner();
+    function review(uint256 tokenId) external lock {
+        if (_guarded[tokenId].owner != msg.sender && _parked[tokenId].owner != msg.sender) revert NotOwner();
+        _swapRoom(tokenId);
         _review(tokenId);
-    }
-
-    // ---- owner, or the Reactive contract ----
-
-    /// @notice Close the position: unstake, remove all liquidity, and send both tokens, the fees
-    ///         and the AERO to the owner. The empty NFT goes back to the owner as well.
-    function close(uint256 tokenId) external {
-        Guarded memory g = guarded[tokenId];
-        if (g.owner == address(0)) revert NotGuarded();
-        if (msg.sender != g.owner) revert NotOwner();
-        _close(tokenId, g, g.owner);
-    }
-
-    /// @notice Close the position and get it all back in one token (for example USDC): both of the
-    ///         pool's tokens are swapped into `tokenOut`; AERO earned is swapped too when it is one
-    ///         of the pool's tokens, otherwise it is sent as AERO. Owner only.
-    /// @param from0 swap of the pool's token0 into `tokenOut` (skipped when token0 is `tokenOut`);
-    ///        its `amountIn` is ignored: everything the position returned is swapped.
-    /// @param from1 the same for token1.
-    /// @return out how much `tokenOut` the owner received.
-    /// @dev The `minOut` floors are worked out off-chain by the page from the position's current
-    ///      amounts; if the price moved, the whole close reverts and the position stays as it was.
-    function closeTo(uint256 tokenId, address tokenOut, SwapLeg calldata from0, SwapLeg calldata from1)
-        external
-        returns (uint256 out)
-    {
-        Guarded memory g = guarded[tokenId];
-        if (g.owner == address(0)) revert NotGuarded();
-        if (msg.sender != g.owner) revert NotOwner();
-        (,, address token0, address token1,,,,,,,,) = npm.positions(tokenId);
-
-        _close(tokenId, g, address(this));
-
-        if (token0 != tokenOut) {
-            _swap(from0.pool, token0, tokenOut, IERC20(token0).balanceOf(address(this)), from0.minOut);
-        }
-        if (token1 != tokenOut) {
-            _swap(from1.pool, token1, tokenOut, IERC20(token1).balanceOf(address(this)), from1.minOut);
-        }
-        out = IERC20(tokenOut).balanceOf(address(this));
-        _refund(tokenOut);
-        _refund(token0);
-        _refund(token1);
-        _refund(address(aero));
     }
 
     /// @notice The daily review of every guarded position, asked for by the Reactive contract's
     ///         timer. A position whose pool has no price history yet is skipped, not closed.
-    function reviewByReactive(address sender_) external onlyServiceProvider onlyCallbackSender(sender_) {
-        uint256 len = reviewList.length;
+    function reviewByReactive(address sender_) external lock onlyServiceProvider onlyCallbackSender(sender_) {
+        uint256 len = _reviewList.length;
         if (len == 0) return;
         uint256 n = len < MAX_REVIEW ? len : MAX_REVIEW;
         uint256 start = reviewCursor % len;
         uint256[] memory ids = new uint256[](n);
         for (uint256 i = 0; i < n; i++) {
-            ids[i] = reviewList[(start + i) % len];
+            ids[i] = _reviewList[(start + i) % len];
         }
         uint256 done;
         for (; done < n; done++) {
@@ -414,14 +94,14 @@ contract PositionGuard is AbstractCallback {
     ///         each position's pool, and closes a position whose pool's 30-minute average price has
     ///         stayed outside its range for its grace period. Snapshots make `netPerDay` measurable
     ///         within hours of a deposit instead of days.
-    function checkByReactive(address sender_) external onlyServiceProvider onlyCallbackSender(sender_) {
-        uint256 len = reviewList.length;
+    function checkByReactive(address sender_) external lock onlyServiceProvider onlyCallbackSender(sender_) {
+        uint256 len = _reviewList.length;
         if (len == 0) return;
         uint256 n = len < MAX_CHECK ? len : MAX_CHECK;
         uint256 start = checkCursor % len;
         uint256[] memory ids = new uint256[](n);
         for (uint256 i = 0; i < n; i++) {
-            ids[i] = reviewList[(start + i) % len];
+            ids[i] = _reviewList[(start + i) % len];
         }
         uint256 done;
         for (; done < n; done++) {
@@ -438,10 +118,12 @@ contract PositionGuard is AbstractCallback {
     /// @dev Called by the guard on itself so one failing position cannot stop the others.
     function checkOne(uint256 tokenId) external {
         if (msg.sender != address(this)) revert NotOwner();
-        Guarded memory g = guarded[tokenId];
-        if (g.owner == address(0)) return;
-        _snap(g.pool);
-        if (_rangeStep(tokenId, g)) return; // closed
+        Guarded memory g = _guarded[tokenId];
+        if (g.owner != address(0)) {
+            _snap(g.pool);
+            if (_rangeStep(tokenId, g)) return; // closed
+        }
+        // alternates of a position, or every pool of a parked plan
         address[] storage alts = alternates[tokenId];
         for (uint256 i = 0; i < alts.length; i++) {
             try meter.snap{gas: SNAP_GAS}(alts[i]) {} catch {}
@@ -451,7 +133,7 @@ contract PositionGuard is AbstractCallback {
     /// @dev Updates the out-of-range clock of a position and closes it when the grace period is over
     ///      and both the 30-minute average and the current price are out of range. True if closed.
     function _rangeStep(uint256 tokenId, Guarded memory g) internal returns (bool) {
-        RangeWatch storage w = rangeWatch[tokenId];
+        RangeWatch storage w = _rangeWatch[tokenId];
         if (w.grace == 0) return false;
         (,,,,, int24 lower, int24 upper,,,,,) = npm.positions(tokenId);
         int24 avg = _twapTick(g.pool);
@@ -474,104 +156,18 @@ contract PositionGuard is AbstractCallback {
             emit CloseDeferred(tokenId, spot, avg);
             return false;
         }
-        _close(tokenId, g, g.owner);
+        _exit(tokenId, g);
         return true;
     }
-
-    /// @dev Unstakes, removes all liquidity and sends the tokens, fees and AERO to `to` (the owner,
-    ///      or the guard itself when `closeTo` swaps them first). The empty NFT always goes to the owner.
-    function _close(uint256 tokenId, Guarded memory g, address to) internal {
-        delete guarded[tokenId];
-        delete alternates[tokenId];
-        delete netExitBps[tokenId];
-        delete rangeWatch[tokenId];
-        delete pricePool[tokenId];
-        delete moveVote[tokenId];
-        delete moveVoteAt[tokenId];
-        _unlist(tokenId);
-
-        uint256 aeroPaid = _unstake(tokenId, g, to);
-
-        (,,,,,,, uint128 liquidity,,,,) = npm.positions(tokenId);
-        if (liquidity > 0) {
-            npm.decreaseLiquidity(
-                INonfungiblePositionManager.DecreaseLiquidityParams({
-                    tokenId: tokenId, liquidity: liquidity, amount0Min: 0, amount1Min: 0, deadline: block.timestamp
-                })
-            );
-        }
-        (uint256 amount0, uint256 amount1) = npm.collect(
-            INonfungiblePositionManager.CollectParams({
-                tokenId: tokenId, recipient: to, amount0Max: type(uint128).max, amount1Max: type(uint128).max
-            })
-        );
-        npm.transferFrom(address(this), g.owner, tokenId);
-        emit Closed(tokenId, g.owner, msg.sender, amount0, amount1, aeroPaid);
-    }
-
-    // ---- views ----
-
-    /// @notice AERO the position has earned in the gauge and not yet claimed.
-    function pendingAero(uint256 tokenId) external view returns (uint256) {
-        Guarded memory g = guarded[tokenId];
-        if (g.gauge == address(0)) return 0;
-        uint256[] memory ids = new uint256[](1);
-        ids[0] = tokenId;
-        return ICLGauge(g.gauge).earned(address(this), ids);
-    }
-
-    /// @notice The review's numbers for a position right now, without acting on them.
-    ///         All in the pool's token1 at the 30-minute average price.
-    function standing(uint256 tokenId)
-        public
-        view
-        returns (uint256 holdValue, uint256 positionValue, uint256 aeroValue)
-    {
-        Guarded storage g = guarded[tokenId];
-        if (g.owner == address(0)) revert NotGuarded();
-        return meter.standing(tokenId, g.pool, g.entry0, g.entry1, g.aeroPaid, pricePool[tokenId]);
-    }
-
-    /// @notice The other pools this position may be moved into.
-    function alternatesOf(uint256 tokenId) external view returns (address[] memory) {
-        return alternates[tokenId];
-    }
-
-    /// @notice `netRate` for this position's own pool and range, per day (1e18 = 100% of its value),
-    ///         and whether all of it was measured: a staked position, a full pay window, at least
-    ///         three price snapshots, and a price for AERO. A reading that is not measured is never
-    ///         acted on, so a pool is not left just because the guard has not watched it long enough.
-    ///         Like `payRate`, it describes a position that sits in range: one out of range earns no
-    ///         AERO whatever this says, and leaving it is the job of the out-of-range close (graceSeconds).
-    function netPerDay(uint256 tokenId) public view returns (int256 net, bool measured) {
-        Guarded storage g = guarded[tokenId];
-        if (g.owner == address(0)) revert NotGuarded();
-        if (g.gauge == address(0)) return (0, false);
-        (,,,, int24 spacing, int24 lower, int24 upper,,,,,) = npm.positions(tokenId);
-        return meter.netPerDay(g.pool, (upper - lower) / 2, spacing, pricePool[tokenId]);
-    }
-
-    /// @notice Positions the daily review goes through.
-    function reviewCount() external view returns (uint256) {
-        return reviewList.length;
-    }
-
-    /// @notice Called by a pool during `_swap` to be paid. Only the pool the guard is swapping in
-    ///         right now gets anything, and only the amount it is owed.
-    function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external {
-        if (msg.sender != swapPool || msg.sender == address(0)) revert NotSwapPool();
-        address tokenIn = abi.decode(data, (address));
-        uint256 owed = uint256(amount0Delta > 0 ? amount0Delta : amount1Delta);
-        if (!IERC20(tokenIn).transfer(msg.sender, owed)) revert TransferFailed();
-    }
-
-    // ---- internals ----
 
     /// @dev Claims the AERO earned so far to the owner, then compares the position with holding
     ///      and closes it if it is behind by more than the owner's limit.
     function _review(uint256 tokenId) internal {
-        Guarded storage g = guarded[tokenId];
-        if (g.owner == address(0)) return;
+        Guarded storage g = _guarded[tokenId];
+        if (g.owner == address(0)) {
+            if (_parked[tokenId].owner != address(0)) _reviewPark(tokenId);
+            return;
+        }
         if (g.gauge != address(0)) {
             uint256 before = aero.balanceOf(g.owner);
             uint256[] memory ids = new uint256[](1);
@@ -579,15 +175,15 @@ contract PositionGuard is AbstractCallback {
             ICLGauge(g.gauge).claimEmissions(address(this), g.owner, ids);
             g.aeroPaid += aero.balanceOf(g.owner) - before;
         }
-        (uint256 holdValue, uint256 positionValue, uint256 aeroValue) = standing(tokenId);
+        (uint256 holdValue, uint256 positionValue, uint256 aeroValue) = _standing(tokenId);
         bool behind =
             g.maxLossBps > 0 && (positionValue + aeroValue) * 10_000 < holdValue * (10_000 - uint256(g.maxLossBps));
-        uint16 netLimit = netExitBps[tokenId];
+        uint16 netLimit = _netExitBps[tokenId];
         bool netDue;
         int256 net;
         if (!behind && netLimit > 0 && g.gauge != address(0)) {
             bool measured;
-            (net, measured) = netPerDay(tokenId);
+            (net, measured) = _netPerDay(tokenId);
             // 1 basis point a day = 1e14 in the 1e18 share scale
             netDue = measured && net < -int256(uint256(netLimit)) * 1e14;
             behind = netDue;
@@ -605,103 +201,12 @@ contract PositionGuard is AbstractCallback {
         emit Reviewed(tokenId, holdValue, positionValue, aeroValue, behind);
         // Readings are only needed for positions that stay; a close must fit in GAS_PER_REVIEW.
         if (behind) {
-            _close(tokenId, g, g.owner);
+            _exit(tokenId, g);
         } else {
             _markPays(tokenId, g.pool);
             // a pool that fails to read or a mint that reverts must not undo the review
             try this.moveStep(tokenId) {} catch {}
         }
-    }
-
-    /// @dev Moves a staked position into the alternate pool that has earned the most net of price
-    ///      swings, when it beats the current pool by MOVE_MARGIN at two reviews in a row and neither
-    ///      pool's price is being pushed right now. Readings only: no forecast, nothing unmeasured.
-    /// @dev Called by the guard on itself from the review (see `_maybeMove`).
-    function moveStep(uint256 tokenId) external {
-        if (msg.sender != address(this)) revert NotOwner();
-        _maybeMove(tokenId);
-    }
-
-    function _maybeMove(uint256 tokenId) internal {
-        Guarded memory g = guarded[tokenId];
-        address[] memory alts = alternates[tokenId];
-        if (alts.length == 0 || g.gauge == address(0)) return;
-        // only on a full reading of the current pool: pay, swings, a price for AERO, a real width
-        (, bool ok) = netPerDay(tokenId);
-        if (!ok) return;
-        (,,,,, int24 lower, int24 upper,,,,,) = npm.positions(tokenId);
-        int24 half = (upper - lower) / 2;
-        address via = pricePool[tokenId];
-        address target = meter.bestAlternate(alts, half, via, meter.netRate(g.pool, half, via) + int256(MOVE_MARGIN));
-        if (target == address(0)) {
-            delete moveVote[tokenId];
-            return;
-        }
-        if (moveVote[tokenId] != target) {
-            moveVote[tokenId] = target;
-            moveVoteAt[tokenId] = uint64(block.timestamp);
-            return;
-        }
-        if (block.timestamp < moveVoteAt[tokenId] + MOVE_WAIT) return;
-        // both pools trade the same pair: their averages must agree, and neither may be pushed now
-        int24 d = _twapTick(g.pool) - _twapTick(target);
-        if (_pushed(g.pool) || _pushed(target) || d > MAX_SPOT_DEVIATION || -d > MAX_SPOT_DEVIATION) return;
-        _move(tokenId, g, target, half, alts);
-    }
-
-    /// @dev True when the pool's current price is more than MAX_SPOT_DEVIATION from its 30-minute average.
-    function _pushed(address pool) internal view returns (bool) {
-        (, int24 spot,,,,) = ICLPool(pool).slot0();
-        int24 avg = _twapTick(pool);
-        return (spot > avg ? spot - avg : avg - spot) > MAX_SPOT_DEVIATION;
-    }
-
-    /// @dev Closes the position into the guard and opens one of the same width around the price in
-    ///      `target`, staked and guarded with the same settings. The old pool becomes an alternate.
-    ///      AERO earned and whatever the new range does not take go straight to the owner.
-    function _move(uint256 tokenId, Guarded memory g, address target, int24 half, address[] memory alts) internal {
-        uint16 maxLoss = g.maxLossBps;
-        uint16 netExit = netExitBps[tokenId];
-        uint32 grace = rangeWatch[tokenId].grace;
-        address via = pricePool[tokenId];
-        (address t0, address t1) = _poolTokens(target);
-        // count only what this position returns, never coins that happen to sit on the guard
-        uint256 b0 = IERC20(t0).balanceOf(address(this));
-        uint256 b1 = IERC20(t1).balanceOf(address(this));
-        uint256 bA = aero.balanceOf(address(this));
-        _close(tokenId, g, address(this));
-        uint256 a0 = IERC20(t0).balanceOf(address(this)) - b0;
-        uint256 a1 = IERC20(t1).balanceOf(address(this)) - b1;
-        IERC20(t0).approve(address(npm), a0);
-        IERC20(t1).approve(address(npm), a1);
-        int24 steps = half / ICLPool(target).tickSpacing();
-        uint256 newId = _mintAndRecord(
-            _rangeParams(target, uint16(uint24(steps > 0 ? steps : int24(1))), t0, t1, a0, a1, 0, 0), maxLoss
-        );
-        _guard(newId, g.owner, true, grace);
-        netExitBps[newId] = netExit;
-        pricePool[newId] = via;
-        for (uint256 i = 0; i < alts.length; i++) {
-            if (alts[i] == target) alts[i] = g.pool;
-        }
-        alternates[newId] = alts;
-        _sendNew(t0, g.owner, b0);
-        _sendNew(t1, g.owner, b1);
-        if (address(aero) != t0 && address(aero) != t1) _sendNew(address(aero), g.owner, bA);
-        emit Moved(tokenId, newId, target);
-    }
-
-    /// @dev Sends `to` what the guard holds of `token` above `before`, and clears the position manager's allowance.
-    function _sendNew(address token, address to, uint256 before) internal {
-        IERC20(token).approve(address(npm), 0);
-        uint256 bal = IERC20(token).balanceOf(address(this));
-        if (bal > before && !IERC20(token).transfer(to, bal - before)) revert TransferFailed();
-    }
-
-    /// @dev Takes a new reading of the pool's reward counter, at most once per MIN_PAY_WINDOW, keeping
-    ///      the previous one so `payRate` always has a full window to measure over.
-    function _markPay(address pool) internal {
-        meter.markPay(pool);
     }
 
     /// @dev Reads the reward counter and keeps a price snapshot for the current pool and its alternates.
@@ -716,202 +221,13 @@ contract PositionGuard is AbstractCallback {
         }
     }
 
-    /// @dev Keeps the pool's 30-minute average tick, at most once per SNAP_GAP, overwriting the oldest.
-    function _snap(address pool) internal {
-        meter.snap(pool);
-    }
-
-    /// @dev sqrt price at the pool's average tick over the last TWAP_WINDOW.
-    ///      Both the position and holding are valued at this one price (the position at the amounts
-    ///      it would hold there), so a trade that moves the spot price changes neither number.
-    function _twapSqrt(address pool) internal view returns (uint160) {
-        return sugar.getSqrtRatioAtTick(_twapTick(pool));
-    }
-
-    /// @dev The pool's average tick over the last TWAP_WINDOW, rounded towards -infinity.
-    function _twapTick(address pool) internal view returns (int24) {
-        return PoolMath.twapTick(pool);
-    }
-
-    /// @dev `amount0` of token0 expressed in token1 at sqrt price `sqrtP`.
-    function _in1(uint256 amount0, uint160 sqrtP) internal pure returns (uint256) {
-        return amount0.mulDiv(sqrtP, Q96).mulDiv(sqrtP, Q96);
-    }
-
-    /// @dev The pool's two tokens, after checking it is a real pool of the position manager's factory.
-    function _poolTokens(address pool) internal view returns (address token0, address token1) {
-        token0 = ICLPool(pool).token0();
-        token1 = ICLPool(pool).token1();
-        if (ICLFactory(npm.factory()).getPool(token0, token1, ICLPool(pool).tickSpacing()) != pool) {
-            revert UnknownPool();
-        }
-    }
-
-    /// @dev Opens the position around the current price and guards it for the caller.
-    ///      The position manager must already be approved for `amount0` and `amount1`.
-    function _mintAndGuard(OpenParams calldata p, address token0, address token1, uint256 amount0, uint256 amount1)
-        internal
-        returns (uint256 tokenId)
-    {
-        if (p.maxLossBps >= 10_000) revert BadLimit();
-        tokenId = _mintAndRecord(
-            _rangeParams(p.pool, p.halfWidth, token0, token1, amount0, amount1, p.amount0Min, p.amount1Min),
-            p.maxLossBps
-        );
-        _guard(tokenId, msg.sender, p.stake, p.graceSeconds);
-    }
-
-    /// @dev Mints and records what went in and the loss limit; `_guard` does the rest.
-    function _mintAndRecord(INonfungiblePositionManager.MintParams memory m, uint16 maxLossBps)
-        internal
-        returns (uint256 tokenId)
-    {
-        uint256 used0;
-        uint256 used1;
-        nftExpected = 1;
-        (tokenId,, used0, used1) = npm.mint(m);
-        nftExpected = 0;
-        _record(tokenId, maxLossBps, used0, used1);
-    }
-
-    function _record(uint256 tokenId, uint16 maxLossBps, uint256 entry0, uint256 entry1) internal {
-        Guarded storage g = guarded[tokenId];
-        g.maxLossBps = maxLossBps;
-        g.entry0 = uint128(entry0);
-        g.entry1 = uint128(entry1);
-    }
-
-    /// @dev Mint parameters for a range of ± halfWidth tick spacings around the current price.
-    function _rangeParams(
-        address pool,
-        uint16 halfWidth,
-        address token0,
-        address token1,
-        uint256 amount0,
-        uint256 amount1,
-        uint256 min0,
-        uint256 min1
-    ) internal view returns (INonfungiblePositionManager.MintParams memory) {
-        int24 spacing = ICLPool(pool).tickSpacing();
-        (, int24 tick,,,,) = ICLPool(pool).slot0();
-        int24 base = tick / spacing;
-        if (tick < 0 && tick % spacing != 0) base -= 1; // round down for negative ticks
-        int24 half = int24(uint24(halfWidth));
-        return INonfungiblePositionManager.MintParams({
-            token0: token0,
-            token1: token1,
-            tickSpacing: spacing,
-            tickLower: (base - half) * spacing,
-            tickUpper: (base + 1 + half) * spacing,
-            amount0Desired: amount0,
-            amount1Desired: amount1,
-            amount0Min: min0,
-            amount1Min: min1,
-            recipient: address(this),
-            deadline: block.timestamp,
-            sqrtPriceX96: 0
-        });
-    }
-
-    /// @dev Swaps exactly `amountIn` of `tokenIn` (or less, if the pool runs out) for `tokenOut`
-    ///      in `pool`, which must be a real pool of exactly these two tokens.
-    function _swap(address pool, address tokenIn, address tokenOut, uint256 amountIn, uint256 minOut) internal {
-        if (amountIn == 0) return;
-        (address t0, address t1) = _poolTokens(pool);
-        bool zeroForOne = tokenIn == t0;
-        if (zeroForOne ? t1 != tokenOut : (t1 != tokenIn || t0 != tokenOut)) revert BadSwapPool();
-
-        uint256 before = IERC20(tokenOut).balanceOf(address(this));
-        swapPool = pool;
-        ICLPool(pool)
-            .swap(
-                address(this),
-                zeroForOne,
-                int256(amountIn),
-                zeroForOne ? MIN_SQRT_RATIO + 1 : MAX_SQRT_RATIO - 1,
-                abi.encode(tokenIn)
-            );
-        swapPool = address(0);
-        if (IERC20(tokenOut).balanceOf(address(this)) - before < minOut) revert TooLittleReceived();
-    }
-
-    /// @dev Records the owner (what went in is recorded before), stakes if asked, lists the position for the daily
-    ///      review, and tells the Reactive contract what to watch.
-    function _guard(uint256 tokenId, address owner, bool stake, uint32 graceSeconds) internal {
-        address pool = _poolOf(tokenId);
-        address gauge;
-        if (stake) {
-            gauge = ICLPool(pool).gauge();
-            npm.approve(gauge, tokenId);
-            ICLGauge(gauge).deposit(tokenId);
-        }
-        Guarded storage g = guarded[tokenId];
-        g.owner = owner;
-        g.gauge = gauge;
-        g.pool = pool;
-        _list(tokenId);
-        _markPay(pool);
-        // a pool too new to have 30 minutes of prices must not stop the deposit
-        try meter.snap(pool) {} catch {}
-        rangeWatch[tokenId].grace = graceSeconds;
-        emit Deposited(tokenId, owner, gauge);
-    }
-
-    /// @dev The pool a position sits in.
-    function _poolOf(uint256 tokenId) internal view returns (address) {
-        (,, address token0, address token1, int24 tickSpacing,,,,,,,) = npm.positions(tokenId);
-        return ICLFactory(npm.factory()).getPool(token0, token1, tickSpacing);
-    }
-
-    function _list(uint256 tokenId) internal {
-        reviewList.push(tokenId);
-        reviewSlot[tokenId] = reviewList.length;
-    }
-
-    function _unlist(uint256 tokenId) internal {
-        uint256 slot = reviewSlot[tokenId];
-        if (slot == 0) return;
-        uint256 last = reviewList[reviewList.length - 1];
-        reviewList[slot - 1] = last;
-        reviewSlot[last] = slot;
-        reviewList.pop();
-        delete reviewSlot[tokenId];
-    }
-
-    /// @dev Takes `amount` of `token` from the caller and lets the position manager spend exactly that.
-    function _pull(address token, uint256 amount) internal {
-        if (amount == 0) return;
-        if (!IERC20(token).transferFrom(msg.sender, address(this), amount)) revert TransferFailed();
-        if (!IERC20(token).approve(address(npm), amount)) revert TransferFailed();
-    }
-
-    /// @dev Sends back what the mint did not use and clears the leftover allowance.
-    ///      The guard never holds tokens between calls, so its whole balance is the leftover.
-    function _refund(address token) internal {
-        IERC20(token).approve(address(npm), 0);
-        uint256 left = IERC20(token).balanceOf(address(this));
-        if (left > 0 && !IERC20(token).transfer(msg.sender, left)) revert TransferFailed();
-    }
-
-    /// @dev Claims the position's AERO to `to` and takes the NFT out of the gauge.
-    ///      AERO is measured by the balance of `to` so it is right whether the gauge pays on
-    ///      claim, on withdraw, or both.
-    function _unstake(uint256 tokenId, Guarded memory g, address to) internal returns (uint256 aeroPaid) {
-        if (g.gauge == address(0)) return 0;
-        uint256 toBefore = aero.balanceOf(to);
-        uint256 selfBefore = aero.balanceOf(address(this));
-        uint256[] memory ids = new uint256[](1);
-        ids[0] = tokenId;
-        ICLGauge(g.gauge).claimEmissions(address(this), to, ids);
-        nftExpected = 1;
-        ICLGauge(g.gauge).withdraw(tokenId);
-        nftExpected = 0;
-        // Anything the gauge paid to the guard itself on withdraw belongs to this position's owner.
-        if (to != address(this)) {
-            uint256 stray = aero.balanceOf(address(this)) - selfBefore;
-            if (stray > 0) aero.transfer(to, stray);
-        }
-        aeroPaid = aero.balanceOf(to) - toBefore;
+    /// @notice Called by a pool during `_swap` to be paid. Only the pool the guard is swapping in
+    ///         right now gets anything, and only the amount it is owed.
+    function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external {
+        if (msg.sender != swapPool || msg.sender == address(0)) revert NotSwapPool();
+        address tokenIn = abi.decode(data, (address));
+        uint256 owed = uint256(amount0Delta > 0 ? amount0Delta : amount1Delta);
+        if (!IERC20(tokenIn).transfer(msg.sender, owed)) revert TransferFailed();
     }
 
     /// @dev Only NFTs the guard is taking in itself (a gauge returning a position, or a mint) are
@@ -919,5 +235,313 @@ contract PositionGuard is AbstractCallback {
     function onERC721Received(address, address, uint256, bytes calldata) external view returns (bytes4) {
         if (msg.sender != address(npm) || nftExpected == 0) revert NotGuarded();
         return this.onERC721Received.selector;
+    }
+
+    // ---- owner functions and views ----
+
+    /// @notice Hand a position to the guard. The caller must own it and have approved the guard.
+    ///         The review compares against what the position holds at this moment.
+    /// @param stake true to stake it in the pool's gauge (earns AERO), false to hold it unstaked (earns fees).
+    /// @param graceSeconds how long the price must stay outside the position's range before it is
+    ///        closed automatically. Zero turns the automatic close off.
+    /// @dev Any ETH sent along stays in the guard and pays for the Reactive callback.
+    function deposit(uint256 tokenId, bool stake, uint32 graceSeconds) external payable lock {
+        if (_parked[tokenId].owner != address(0)) revert IsParked();
+        npm.transferFrom(msg.sender, address(this), tokenId);
+        (uint160 sqrtP,,,,,) = ICLPool(_poolOf(tokenId)).slot0();
+        (uint256 a0, uint256 a1) = sugar.principal(address(npm), tokenId, sqrtP);
+        _record(tokenId, 0, a0, a1);
+        _guard(tokenId, msg.sender, stake, graceSeconds);
+    }
+
+    /// @notice Keep (true) or send out (false) the coins when the guard closes this position by itself.
+    function setReenter(uint256 tokenId, bool on) external {
+        Guarded storage g = _guarded[tokenId];
+        if (g.owner != msg.sender) revert NotOwner();
+        if (on && g.gauge == address(0)) revert BadLimit();
+        if (on && _pricePool[tokenId] == address(0)) {
+            (address t0, address t1) = _poolTokens(g.pool);
+            if (t0 != address(aero) && t1 != address(aero)) revert BadPricePool();
+        }
+        _reenterOn[tokenId] = on;
+    }
+
+    /// @notice Take parked coins back, at any moment. Needs nothing but the two transfers.
+    function takeParked(uint256 id) external lock {
+        Park memory k = _parked[id];
+        if (k.owner != msg.sender) revert NotOwner();
+        _unpark(id, k);
+        _forget(id);
+        if (k.bal0 > 0 && !IERC20(k.token0).transfer(k.owner, k.bal0)) revert TransferFailed();
+        if (k.bal1 > 0 && !IERC20(k.token1).transfer(k.owner, k.bal1)) revert TransferFailed();
+        emit Unparked(id, k.owner, k.bal0, k.bal1);
+    }
+
+    /// @notice Take the position back as it is, with any AERO it earned.
+    function withdraw(uint256 tokenId) external lock {
+        Guarded memory g = _guarded[tokenId];
+        if (g.owner != msg.sender) revert NotOwner();
+        delete _guarded[tokenId];
+        _forget(tokenId);
+        _unstake(tokenId, g, g.owner);
+        npm.transferFrom(address(this), g.owner, tokenId);
+        emit Withdrawn(tokenId, g.owner);
+    }
+
+    /// @notice Set how far behind simply holding the position may fall before the daily review
+    ///         closes it, in basis points (100 = 1%). Zero: the review only reports, never closes.
+    function setMaxLoss(uint256 tokenId, uint16 maxLossBps) external {
+        Guarded storage g = _guarded[tokenId];
+        if (g.owner != msg.sender) revert NotOwner();
+        if (maxLossBps >= 10_000) revert BadLimit();
+        g.maxLossBps = maxLossBps;
+        emit MaxLossSet(tokenId, maxLossBps);
+    }
+
+    /// @notice Name up to three other pools of the same two tokens (for example the same pair with a
+    ///         different price step) that this position may be moved into when they pay more.
+    ///         An empty list turns moving off.
+    function setAlternates(uint256 tokenId, address[] calldata pools) external {
+        Guarded storage g = _guarded[tokenId];
+        if (g.owner != msg.sender) revert NotOwner();
+        if (pools.length > MAX_ALTERNATES) revert TooManyAlternates();
+        (address t0, address t1) = _poolTokens(g.pool);
+        for (uint256 i = 0; i < pools.length; i++) {
+            (address a0, address a1) = _poolTokens(pools[i]);
+            if (a0 != t0 || a1 != t1 || pools[i] == g.pool) revert NotSamePair();
+        }
+        alternates[tokenId] = pools;
+        emit AlternatesSet(tokenId, pools);
+    }
+
+    /// @notice Name the pool that prices AERO for this position when its own pool has no AERO in it:
+    ///         a pool of AERO and one of the position's two tokens (for WETH/USDC, AERO/WETH or
+    ///         AERO/USDC). Owner only, so nobody can point the guard at a thin pool whose price is
+    ///         cheap to move. Zero turns it off.
+    function setPricePool(uint256 tokenId, address via) external {
+        Guarded storage g = _guarded[tokenId];
+        if (g.owner != msg.sender) revert NotOwner();
+        if (via != address(0)) {
+            meter.aeroPrice(g.pool, via); // reverts unless it prices AERO for this pool
+        } else if (_reenterOn[tokenId]) {
+            // parked coins go back in on AERO pay: a pair without AERO must keep its price (Codex 26.11)
+            (address t0, address t1) = _poolTokens(g.pool);
+            if (t0 != address(aero) && t1 != address(aero)) revert BadPricePool();
+        }
+        _pricePool[tokenId] = via;
+        emit PricePoolSet(tokenId, via);
+    }
+
+    /// @notice Close at the review when sitting in the pool no longer pays: the AERO the pool pays
+    ///         (priced in token1) minus what the position is expected to lose to price swings
+    ///         (`netRate`) is below minus `bpsPerDay` basis points of its value a day. Owner only.
+    ///         Zero turns it off. Only staked positions earn AERO, so it only acts on those, and only
+    ///         once the pool's pay, price swings and AERO price have all been measured.
+    function setNetExit(uint256 tokenId, uint16 bpsPerDay) external {
+        Guarded storage g = _guarded[tokenId];
+        if (g.owner != msg.sender) revert NotOwner();
+        if (bpsPerDay >= 10_000) revert BadLimit();
+        _netExitBps[tokenId] = bpsPerDay;
+        emit NetExitSet(tokenId, bpsPerDay);
+    }
+
+    /// @notice Close the position: unstake, remove all liquidity, and send both tokens, the fees
+    ///         and the AERO to the owner. The empty NFT goes back to the owner as well.
+    function close(uint256 tokenId) external lock {
+        Guarded memory g = _guarded[tokenId];
+        if (g.owner == address(0)) revert NotGuarded();
+        if (msg.sender != g.owner) revert NotOwner();
+        _swapRoom(tokenId);
+        _closeOut(tokenId, g);
+    }
+
+    /// @dev A wallet estimates the least gas a call succeeds with, and a close succeeds without its exit
+    ///      swap too: so an owner's call that may close asks for room for the swap up front.
+    function _swapRoom(uint256 tokenId) internal view {
+        if (_exitToken[tokenId] != address(0) && gasleft() < 2_500_000) revert BadLimit();
+    }
+
+    /// @dev Called by the guard on itself during a close: swaps `amountIn` in `pool` into the other token,
+    ///      valued at the 30-minute average: at most MAX_SPOT_DEVIATION past it and at least 98% of its value.
+    function swapOut(address pool, bool zeroForOne, uint256 amountIn) external {
+        if (msg.sender != address(this)) revert NotOwner();
+        address tIn = zeroForOne ? ICLPool(pool).token0() : ICLPool(pool).token1();
+        address tOut = zeroForOne ? ICLPool(pool).token1() : ICLPool(pool).token0();
+        int24 avg = _twapTick(pool);
+        uint160 sp = sugar.getSqrtRatioAtTick(avg);
+        uint256 fair = zeroForOne ? _in1(amountIn, sp) : MulDiv.mulDiv(MulDiv.mulDiv(amountIn, Q96, sp), Q96, sp);
+        uint256 before = IERC20(tIn).balanceOf(address(this));
+        _swap(
+            pool,
+            zeroForOne,
+            tIn,
+            tOut,
+            amountIn,
+            fair * 98 / 100,
+            sugar.getSqrtRatioAtTick(zeroForOne ? avg - MAX_SPOT_DEVIATION : avg + MAX_SPOT_DEVIATION)
+        );
+        // stopped at the price limit with part unsold: not an exit into the exit token (Codex 26.11)
+        if (before - IERC20(tIn).balanceOf(address(this)) < amountIn) revert TooLittleReceived();
+    }
+
+    /// @notice AERO the position has earned in the gauge and not yet claimed.
+    function pendingAero(uint256 tokenId) external view returns (uint256) {
+        Guarded memory g = _guarded[tokenId];
+        if (g.gauge == address(0)) return 0;
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = tokenId;
+        return ICLGauge(g.gauge).earned(address(this), ids);
+    }
+
+    /// @notice The review's numbers for a position right now, without acting on them.
+    ///         All in the pool's token1 at the 30-minute average price.
+    function standing(uint256 tokenId)
+        public
+        view
+        returns (uint256 holdValue, uint256 positionValue, uint256 aeroValue)
+    {
+        return _standing(tokenId);
+    }
+
+    /// @notice The other pools this position may be moved into.
+    function alternatesOf(uint256 tokenId) external view returns (address[] memory) {
+        return alternates[tokenId];
+    }
+
+    /// @notice `netRate` for this position's own pool and range, per day (1e18 = 100% of its value),
+    ///         and whether all of it was measured: a staked position, a full pay window, at least
+    ///         three price snapshots, and a price for AERO. A reading that is not measured is never
+    ///         acted on, so a pool is not left just because the guard has not watched it long enough.
+    ///         Like `payRate`, it describes a position that sits in range: one out of range earns no
+    ///         AERO whatever this says, and leaving it is the job of the out-of-range close (graceSeconds).
+    function netPerDay(uint256 tokenId) public view returns (int256 net, bool measured) {
+        Guarded storage g = _guarded[tokenId];
+        if (g.owner == address(0)) revert NotGuarded();
+        if (g.gauge == address(0)) return (0, false);
+        (,,,, int24 spacing, int24 lower, int24 upper,,,,,) = npm.positions(tokenId);
+        return meter.netPerDay(g.pool, (upper - lower) / 2, spacing, _pricePool[tokenId]);
+    }
+
+    /// @notice Positions the daily review goes through.
+    function reviewCount() external view returns (uint256) {
+        return _reviewList.length;
+    }
+
+    /// @dev The daily look at a parked plan: measure its pools, and go back in when the same pool has
+    ///      earned more than REENTER_FLOOR net of swings at two reviews at least MOVE_WAIT apart.
+    function _reviewPark(uint256 id) internal {
+        Park memory k = _parked[id];
+        address[] memory pools = alternates[id];
+        for (uint256 i = 0; i < pools.length; i++) {
+            _markPay(pools[i]);
+            try meter.snap(pools[i]) {} catch {}
+        }
+        address best;
+        try meter.bestAlternate(pools, k.half, _pricePool[id], REENTER_FLOOR) returns (address b) {
+            best = b;
+        } catch {}
+        if (best == address(0)) {
+            delete _moveVote[id];
+            return;
+        }
+        if (_moveVote[id] != best) {
+            _moveVote[id] = best;
+            moveVoteAt[id] = uint64(block.timestamp);
+            return;
+        }
+        if (block.timestamp < moveVoteAt[id] + MOVE_WAIT) return;
+        // a failed entry rolls back whole and waits for a fresh pair of readings
+        try IExtSelf(address(this)).enterParked(id, best) {}
+        catch {
+            moveVoteAt[id] = uint64(block.timestamp);
+            emit ReenterFailed(id);
+        }
+    }
+
+    /// @dev Moves a staked position into the alternate pool that has earned the most net of price
+    ///      swings, when it beats the current pool by MOVE_MARGIN at two reviews in a row and neither
+    ///      pool's price is being pushed right now. Readings only: no forecast, nothing unmeasured.
+    /// @dev Called by the guard on itself from the review (see `_maybeMove`).
+    function moveStep(uint256 tokenId) external {
+        if (msg.sender != address(this)) revert NotOwner();
+        _maybeMove(tokenId);
+    }
+
+    function _maybeMove(uint256 tokenId) internal {
+        Guarded memory g = _guarded[tokenId];
+        address[] memory alts = alternates[tokenId];
+        if (alts.length == 0 || g.gauge == address(0)) return;
+        // only on a full reading of the current pool: pay, swings, a price for AERO, a real width
+        (, bool ok) = _netPerDay(tokenId);
+        if (!ok) return;
+        (address target, int24 half) = _moveTarget(tokenId, g.pool, alts);
+        if (target == address(0)) {
+            delete _moveVote[tokenId];
+            return;
+        }
+        if (_moveVote[tokenId] != target) {
+            _moveVote[tokenId] = target;
+            moveVoteAt[tokenId] = uint64(block.timestamp);
+            return;
+        }
+        if (block.timestamp < moveVoteAt[tokenId] + MOVE_WAIT) return;
+        // both pools trade the same pair: their averages must agree, and neither may be pushed now
+        int24 d = _twapTick(g.pool) - _twapTick(target);
+        if (_pushed(g.pool) || _pushed(target) || d > MAX_SPOT_DEVIATION || -d > MAX_SPOT_DEVIATION) return;
+        IExtSelf(address(this)).moveExec(tokenId, target, half);
+    }
+
+    /// @dev The alternate that beats the current pool by MOVE_MARGIN (zero if none), and the half width.
+    function _moveTarget(uint256 tokenId, address pool, address[] memory alts)
+        internal
+        view
+        returns (address target, int24 half)
+    {
+        (,,,,, int24 lower, int24 upper,,,,,) = npm.positions(tokenId);
+        half = (upper - lower) / 2;
+        address via = _pricePool[tokenId];
+        target = meter.bestAlternate(alts, half, via, meter.netRate(pool, half, via) + int256(MOVE_MARGIN));
+    }
+
+    // ---- storage getters (here only, so GuardExt stays under the size limit) ----
+
+    function guarded(uint256 id) external view returns (Guarded memory) {
+        return _guarded[id];
+    }
+
+    function parked(uint256 id) external view returns (Park memory) {
+        return _parked[id];
+    }
+
+    function parkedTotal(address token) external view returns (uint256) {
+        return _parkedTotal[token];
+    }
+
+    function reviewList(uint256 i) external view returns (uint256) {
+        return _reviewList[i];
+    }
+
+    function pricePool(uint256 id) external view returns (address) {
+        return _pricePool[id];
+    }
+
+    function rangeWatch(uint256 id) external view returns (RangeWatch memory) {
+        return _rangeWatch[id];
+    }
+
+    function moveVote(uint256 id) external view returns (address) {
+        return _moveVote[id];
+    }
+
+    function netExitBps(uint256 id) external view returns (uint16) {
+        return _netExitBps[id];
+    }
+
+    function reenterOn(uint256 id) external view returns (bool) {
+        return _reenterOn[id];
+    }
+
+    function exitToken(uint256 id) external view returns (address) {
+        return _exitToken[id];
     }
 }

@@ -3,6 +3,8 @@ pragma solidity ^0.8.29;
 
 import {Test, console2} from "forge-std/Test.sol";
 import {PositionGuard} from "../src/PositionGuard.sol";
+import {IGuard, GuardDeploy} from "./GuardAll.sol";
+import {GuardCore} from "../src/GuardCore.sol";
 import {GuardMeter} from "../src/GuardMeter.sol";
 import {GuardReactive} from "../src/GuardReactive.sol";
 import {IReactive} from "@reactive/src/interfaces/IReactive.sol";
@@ -32,7 +34,7 @@ contract LifecycleForkTest is Test {
     address constant CL100 = 0x2A430bEbD2082d8e05D56d64DEDE8944279bbC24; // WETH/USDC
     address constant VIA = 0xD0Acf293547457Fb4fE9eE32CA93e89497626816; // AERO/USDC prices AERO
 
-    PositionGuard guard;
+    IGuard guard;
     GuardMeter meter;
     GuardReactive clock;
     MockSystem sys;
@@ -46,7 +48,7 @@ contract LifecycleForkTest is Test {
         vm.etch(SYSTEM, address(new MockSystem()).code);
         sys = MockSystem(payable(SYSTEM));
         clock = new GuardReactive(8453);
-        guard = new PositionGuard(NPM, AERO, PROXY, address(clock), SUGAR);
+        guard = GuardDeploy.deploy(NPM, AERO, PROXY, address(clock), SUGAR);
         meter = guard.meter();
         clock.setGuard(address(guard));
         clock.start(TICK, 1 hours, 1 days);
@@ -102,7 +104,7 @@ contract LifecycleForkTest is Test {
         IERC20A(WETH).approve(address(guard), type(uint256).max);
         IERC20A(USDC).approve(address(guard), type(uint256).max);
         uint256 id = guard.open(
-            PositionGuard.OpenParams({
+            GuardCore.OpenParams({
                 pool: CL50,
                 amount0: 1e18,
                 amount1: 3_000e6,
@@ -111,7 +113,11 @@ contract LifecycleForkTest is Test {
                 amount1Min: 0,
                 stake: true,
                 graceSeconds: 3 hours,
-                maxLossBps: 300
+                maxLossBps: 300,
+                alternates: new address[](0),
+                pricePool: address(0),
+                reenter: false,
+                exitToken: address(0)
             })
         );
         guard.setPricePool(id, VIA);

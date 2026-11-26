@@ -3,6 +3,8 @@ pragma solidity ^0.8.29;
 
 import {Test, console2} from "forge-std/Test.sol";
 import {PositionGuard} from "../src/PositionGuard.sol";
+import {IGuard, GuardDeploy} from "./GuardAll.sol";
+import {GuardCore} from "../src/GuardCore.sol";
 import {PoolMath} from "../src/lib/PoolMath.sol";
 import {INonfungiblePositionManager, IERC20} from "../src/interfaces/IAero.sol";
 import {Swapper} from "./Review.fork.t.sol";
@@ -20,7 +22,7 @@ contract CheckForkTest is Test {
     address constant POOL = 0xc85D5CB72d1aaD6f152A8decAd228AE4A59Ac9B3; // AERO/WETH CL200
     address constant SUGAR = 0x0AD09A66af0154a84e86F761313d02d0abB6edd5;
 
-    PositionGuard guard;
+    IGuard guard;
     address user = makeAddr("user");
     address proxy = makeAddr("callbackProxy");
     address reactive = makeAddr("reactiveContract");
@@ -28,7 +30,7 @@ contract CheckForkTest is Test {
 
     function setUp() public {
         vm.createSelectFork(vm.envOr("BASE_RPC_URL", string("https://base-rpc.publicnode.com")), 56_197_000);
-        guard = new PositionGuard(NPM, AERO, proxy, reactive, SUGAR);
+        guard = GuardDeploy.deploy(NPM, AERO, proxy, reactive, SUGAR);
         clock = vm.getBlockTimestamp();
     }
 
@@ -44,7 +46,7 @@ contract CheckForkTest is Test {
         IERC20Approve2(AERO).approve(address(guard), type(uint256).max);
         IERC20Approve2(WETH).approve(address(guard), type(uint256).max);
         id = guard.open(
-            PositionGuard.OpenParams({
+            GuardCore.OpenParams({
                 pool: POOL,
                 amount0: 1_000e18,
                 amount1: 1e18,
@@ -53,7 +55,11 @@ contract CheckForkTest is Test {
                 amount1Min: 0,
                 stake: true,
                 graceSeconds: grace,
-                maxLossBps: 0
+                maxLossBps: 0,
+                alternates: new address[](0),
+                pricePool: address(0),
+                reenter: false,
+                exitToken: address(0)
             })
         );
         vm.stopPrank();

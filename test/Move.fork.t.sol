@@ -3,6 +3,8 @@ pragma solidity ^0.8.29;
 
 import {Test, console2} from "forge-std/Test.sol";
 import {PositionGuard} from "../src/PositionGuard.sol";
+import {IGuard, GuardDeploy} from "./GuardAll.sol";
+import {GuardCore} from "../src/GuardCore.sol";
 import {GuardMeter} from "../src/GuardMeter.sol";
 import {INonfungiblePositionManager, ICLPool, IERC20} from "../src/interfaces/IAero.sol";
 
@@ -22,7 +24,7 @@ contract MoveForkTest is Test {
     address constant CL50 = 0x4A7af46bC8aBc00048c6c7920a1488DAF568366c; // WETH/USDC, step 50
     address constant CL100 = 0x2A430bEbD2082d8e05D56d64DEDE8944279bbC24; // WETH/USDC, step 100
 
-    PositionGuard guard;
+    IGuard guard;
     GuardMeter meter;
     address user = makeAddr("user");
     address proxy = makeAddr("proxy");
@@ -31,7 +33,7 @@ contract MoveForkTest is Test {
 
     function setUp() public {
         vm.createSelectFork(vm.envOr("BASE_RPC_URL", string("https://base-rpc.publicnode.com")), 56_197_000);
-        guard = new PositionGuard(NPM, AERO, proxy, reactive, SUGAR);
+        guard = GuardDeploy.deploy(NPM, AERO, proxy, reactive, SUGAR);
         meter = guard.meter();
         clock = vm.getBlockTimestamp();
     }
@@ -48,7 +50,7 @@ contract MoveForkTest is Test {
         IERC20Approve3(WETH).approve(address(guard), type(uint256).max);
         IERC20Approve3(USDC).approve(address(guard), type(uint256).max);
         id = guard.open(
-            PositionGuard.OpenParams({
+            GuardCore.OpenParams({
                 pool: CL50,
                 amount0: 1e18,
                 amount1: 3_000e6,
@@ -57,7 +59,11 @@ contract MoveForkTest is Test {
                 amount1Min: 0,
                 stake: true,
                 graceSeconds: 3 hours,
-                maxLossBps: 300
+                maxLossBps: 300,
+                alternates: new address[](0),
+                pricePool: address(0),
+                reenter: false,
+                exitToken: address(0)
             })
         );
         address[] memory alts = new address[](1);

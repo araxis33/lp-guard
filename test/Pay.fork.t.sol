@@ -3,6 +3,8 @@ pragma solidity ^0.8.29;
 
 import {Test, console2} from "forge-std/Test.sol";
 import {PositionGuard} from "../src/PositionGuard.sol";
+import {IGuard, GuardDeploy} from "./GuardAll.sol";
+import {GuardCore} from "../src/GuardCore.sol";
 import {ICLPool, ICLGauge, ILeafVoter, IERC20} from "../src/interfaces/IAero.sol";
 
 interface IERC20Approve {
@@ -21,13 +23,13 @@ contract PayForkTest is Test {
     address constant AERO_WETH = 0xc85D5CB72d1aaD6f152A8decAd228AE4A59Ac9B3; // another pair
     address constant SUGAR = 0x0AD09A66af0154a84e86F761313d02d0abB6edd5;
 
-    PositionGuard guard;
+    IGuard guard;
     address user = makeAddr("user");
     address stranger = makeAddr("stranger");
 
     function setUp() public {
         vm.createSelectFork(vm.envOr("BASE_RPC_URL", string("https://base-rpc.publicnode.com")), 56_197_000);
-        guard = new PositionGuard(NPM, AERO, makeAddr("proxy"), makeAddr("reactive"), SUGAR);
+        guard = GuardDeploy.deploy(NPM, AERO, makeAddr("proxy"), makeAddr("reactive"), SUGAR);
     }
 
     function _open() internal returns (uint256 id) {
@@ -37,7 +39,7 @@ contract PayForkTest is Test {
         IERC20Approve(WETH).approve(address(guard), type(uint256).max);
         IERC20Approve(USDC).approve(address(guard), type(uint256).max);
         id = guard.open(
-            PositionGuard.OpenParams({
+            GuardCore.OpenParams({
                 pool: CL100,
                 amount0: 1e18,
                 amount1: 5_000e6,
@@ -46,7 +48,11 @@ contract PayForkTest is Test {
                 amount1Min: 0,
                 stake: true,
                 graceSeconds: 0,
-                maxLossBps: 0
+                maxLossBps: 0,
+                alternates: new address[](0),
+                pricePool: address(0),
+                reenter: false,
+                exitToken: address(0)
             })
         );
         vm.stopPrank();
@@ -81,16 +87,16 @@ contract PayForkTest is Test {
     function test_setAlternates_onlyOwner() public {
         uint256 id = _open();
         vm.prank(stranger);
-        vm.expectRevert(PositionGuard.NotOwner.selector);
+        vm.expectRevert(GuardCore.NotOwner.selector);
         guard.setAlternates(id, _alts(CL50));
     }
 
     function test_setAlternates_refusesAnotherPairOrTheSamePool() public {
         uint256 id = _open();
         vm.startPrank(user);
-        vm.expectRevert(PositionGuard.NotSamePair.selector);
+        vm.expectRevert(GuardCore.NotSamePair.selector);
         guard.setAlternates(id, _alts(AERO_WETH));
-        vm.expectRevert(PositionGuard.NotSamePair.selector);
+        vm.expectRevert(GuardCore.NotSamePair.selector);
         guard.setAlternates(id, _alts(CL100));
         vm.stopPrank();
     }
@@ -102,7 +108,7 @@ contract PayForkTest is Test {
             four[i] = CL50;
         }
         vm.prank(user);
-        vm.expectRevert(PositionGuard.TooManyAlternates.selector);
+        vm.expectRevert(GuardCore.TooManyAlternates.selector);
         guard.setAlternates(id, four);
     }
 
@@ -229,9 +235,9 @@ contract PayForkTest is Test {
         vm.mockCall(CL50, abi.encodeWithSignature("lastUpdated()"), abi.encode(uint48(vm.getBlockTimestamp() - 1)));
         assertEq(guard.meter().payRate(CL50, 500), 0); // read as no pay measured, not as a wrap
         vm.prank(user);
-        guard.review(id); // takes the next mark
+        guard.review(id); // the next mark is not taken while the voter can't be read (Codex 26.11)
         (uint256 g1, uint64 at1,,) = guard.meter().payMark(CL50);
-        assertEq(at1, vm.getBlockTimestamp());
+        assertEq(at1, at0, "no mark from a reading without its unsettled part");
         assertEq(g1, g0); // never moved back
     }
 
@@ -251,8 +257,8 @@ contract PayForkTest is Test {
         guard.meter().payRate(CL100, 500_000);
     }
 
-    /// If the voter can't be read, the counter is taken as it stands and the review still runs.
-    function test_payRate_voterReverts_fallsBackToTheCounter() public {
+    /// If the voter can't be read, no pay is measured (never a partial counter), and nothing reverts.
+    function test_payRate_voterReverts_readsAsNoPay() public {
         _open();
         address gauge = ICLPool(CL100).gauge();
         address voter = ICLGauge(gauge).voter();
@@ -260,7 +266,8 @@ contract PayForkTest is Test {
         vm.mockCallRevert(voter, abi.encodeCall(ILeafVoter.projectedCumulativeRewardShare, (gauge)), "down");
         uint256 g = ICLPool(CL100).rewardGrowthGlobalX128();
         vm.mockCall(CL100, abi.encodeWithSignature("rewardGrowthGlobalX128()"), abi.encode(g + 1e30));
-        assertGt(guard.meter().payRate(CL100, 500), 0);
+        vm.mockCall(CL100, abi.encodeWithSignature("lastUpdated()"), abi.encode(uint48(vm.getBlockTimestamp() - 1)));
+        assertEq(guard.meter().payRate(CL100, 500), 0);
     }
 
     /// A reading is taken at most once per window, so many reviews in a row cannot shrink it.
