@@ -49,12 +49,13 @@ a{color:var(--blue)}
   <section class="card">
     <h2>Put money in</h2>
     <div class="row">
-      <input id="amt" inputmode="decimal" placeholder="USDC" value="30">
+      <input id="amt" inputmode="decimal" placeholder="amount" value="30">
+      <select id="pay" style="flex:0 0 auto"><option value="USDC">USDC</option><option value="WETH">WETH</option></select>
       <select id="pool"></select>
       <button id="go">Connect wallet</button>
     </div>
     <ul class="rules">
-      <li>The guard opens in the pool of this pair that has paid most net of price swings (it measures them hourly) and swaps half your USDC there. Range: current price ± 5 steps. Stays staked, so it earns AERO.</li>
+      <li>Pay with USDC or WETH. The guard opens in the pool of this pair that has paid most net of price swings (it measures them hourly) and swaps half of what you pay into the other coin there. Range: current price ± 5 steps. Stays staked, so it earns AERO.</li>
       <li>Reviewed once a day: AERO goes to your wallet, then the position is compared with just holding what you put in.</li>
       <li>Closed for you if it falls more than <b id="r-loss">3%</b> behind holding, or sits out of range for <b id="r-grace">3 hours</b>.</li>
       <li>Also closed when the pool stops paying: its AERO is worth less than what price swings cost by more than <b id="r-net">0.10%</b> a day (measured after 12 hours).</li>
@@ -107,6 +108,8 @@ a{color:var(--blue)}
   };
   const HALF_WIDTH = 5, MAX_LOSS_BPS = 300, GRACE = 3 * 3600, SWAP_FLOOR_BPS = 9900; // 1% worst price on the swaps in
   const MIN_USDC = 1;
+  // what you can pay with: the token, its decimals, the least amount, how many decimals may be typed
+  const PAY = { USDC: [null, 6, "1", 6], WETH: [null, 18, "0.0003", 8] };
   const NET_EXIT_BPS = 10;
   const REENTER_BPS = 10; // the guard's REENTER_FLOOR: back in when a pool earns over 0.10% a day net of swings // leave when the pool pays less than its price swings cost, by more than 0.10% a day
   const DEPOSITED = "0x7896c404bfb9173f4c61824c5e10e743eb885c3fe1c1727ed55ac3a51a350874";
@@ -218,28 +221,36 @@ a{color:var(--blue)}
   const altsCall = (id, pools) => SEL.setAlternates + word(id) + word(64) + word(pools.length) + pools.map((a) => addr(a[0])).join("");
 
   async function putIn() {
+    const sym = el("pay").value;
+    const payTok = sym === "WETH" ? WETH : USDC;
+    const [, dec, least, typed] = PAY[sym];
     const raw = el("amt").value.trim();
-    if (!/^\d+(\.\d{0,6})?$/.test(raw) || Number(raw) < MIN_USDC) throw new Error("Type at least " + MIN_USDC + " USDC.");
-    const amount = BigInt(Math.round(Number(raw) * 1e6));
+    if (!new RegExp("^\\d+(\\.\\d{0," + typed + "})?$").test(raw)) throw new Error("Type an amount of " + sym + " (up to " + typed + " decimals).");
+    // exact decimal to units, no floating point: "0.00608" WETH = 6080000000000000
+    const [ip, fp = ""] = raw.split(".");
+    const amount = BigInt(ip) * 10n ** BigInt(dec) + BigInt((fp + "0".repeat(dec)).slice(0, dec));
+    const [lip, lfp = ""] = least.split(".");
+    if (amount < BigInt(lip) * 10n ** BigInt(dec) + BigInt((lfp + "0".repeat(dec)).slice(0, dec))) throw new Error("Type at least " + least + " " + sym + ".");
     const pool = el("pool").value;
-    const bal = big(words(await call(USDC, SEL.balanceOf + addr(st.account)))[0]);
-    if (bal < amount) throw new Error("Your wallet has " + fmt(bal, 6, 2) + " USDC.");
+    const bal = big(words(await call(payTok, SEL.balanceOf + addr(st.account)))[0]);
+    if (bal < amount) throw new Error("Your wallet has " + fmt(bal, dec, dec === 6 ? 2 : 6) + " " + sym + ".");
     if (Number(big(words(await call(CFG.guard, SEL.reviewCount))[0])) >= MAX_LISTED) throw new Error("The guard is full: it keeps " + MAX_LISTED + " positions at most. Try later.");
     const info = await poolInfo(pool);
-    const usdc0 = info.token0.toLowerCase() === USDC.toLowerCase();
-    const allowance = big(words(await call(USDC, SEL.allowance + addr(st.account) + addr(CFG.guard)))[0]);
+    const pay0 = info.token0.toLowerCase() === payTok.toLowerCase();
+    if (!pay0 && info.token1.toLowerCase() !== payTok.toLowerCase()) throw new Error("This pool has no " + sym + ": pay with one of its two coins.");
+    const allowance = big(words(await call(payTok, SEL.allowance + addr(st.account) + addr(CFG.guard)))[0]);
     if (allowance < amount) {
-      status("st-open", "Step 1 of 3: approve " + fmt(amount, 6, 2) + " USDC in your wallet…");
-      await send(SEL.approve + addr(CFG.guard) + word(amount), USDC, "approval");
+      status("st-open", "Step 1 of 3: approve " + fmt(amount, dec, dec === 6 ? 2 : 6) + " " + sym + " in your wallet…");
+      await send(SEL.approve + addr(CFG.guard) + word(amount), payTok, "approval");
     }
     const alts = ALTS[pool.toLowerCase()] || [];
     const hasAero = [info.token0, info.token1].some((t) => t.toLowerCase() === AERO.toLowerCase());
     const via = hasAero ? ZERO : (AERO_PRICE_VIA[info.token1.toLowerCase()] || AERO_PRICE_VIA[info.token0.toLowerCase()]);
-    status("st-open", "Step 2 of 3: put it in. The guard picks the pool of this pair that pays most, swaps half the USDC there and opens the position. Confirm in your wallet…");
+    status("st-open", "Step 2 of 3: put it in. The guard picks the pool of this pair that pays most, swaps half of the " + sym + " there and opens the position. Confirm in your wallet…");
     // open(OpenParams): a tuple with a dynamic member sits behind an offset; inside it the alternates
     // list sits behind its own offset, counted from the tuple's start (13 head words); the last head
     // word is the exit token: everything comes out in USDC on a close
-    const head = addr(pool) + word(usdc0 ? amount : 0n) + word(usdc0 ? 0n : amount) + word(HALF_WIDTH) + word(0) + word(0) +
+    const head = addr(pool) + word(pay0 ? amount : 0n) + word(pay0 ? 0n : amount) + word(HALF_WIDTH) + word(0) + word(0) +
       word(1) + word(GRACE) + word(MAX_LOSS_BPS) + word(13 * 32) + addr(via) + word(1) + addr(USDC);
     const tail = word(alts.length) + alts.map((x) => addr(x[0])).join("");
     const r = await send(SEL.open + word(32) + head + tail, CFG.guard, "deposit");
