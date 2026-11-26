@@ -5,6 +5,7 @@ import {Test, Vm, console2} from "forge-std/Test.sol";
 import {IGuard, GuardDeploy} from "./GuardAll.sol";
 import {GuardCore} from "../src/GuardCore.sol";
 import {GuardMeter} from "../src/GuardMeter.sol";
+import {GuardExt} from "../src/GuardExt.sol";
 import {PoolMath} from "../src/lib/PoolMath.sol";
 import {INonfungiblePositionManager, ICLPool, IERC20} from "../src/interfaces/IAero.sol";
 
@@ -482,6 +483,23 @@ contract ParkForkTest is Test {
         (, bool ok2) = guard.netPerDay(id);
         assertFalse(ok2, "unreadable pay: not measured");
         ok;
+    }
+
+    function test_open_straightOnTheExtension_refused() public {
+        address ext = guard.ext();
+        deal(USDC, user, 300e6);
+        vm.startPrank(user);
+        IERC20A(USDC).approve(ext, type(uint256).max);
+        vm.expectRevert(GuardCore.NotGuarded.selector);
+        GuardExt(payable(ext)).open(_params(0, 300e6, 20, true));
+        vm.stopPrank();
+    }
+
+    function test_pricePool_cannotBeClearedWhileCoinsWouldBeParked() public {
+        uint256 id = _openAs(user, _params(0.1e18, 300e6, 20, true));
+        vm.prank(user);
+        vm.expectRevert(GuardCore.BadPricePool.selector);
+        guard.setPricePool(id, address(0));
     }
 }
 

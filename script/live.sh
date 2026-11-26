@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Live deploy: PositionGuard (+ its GuardMeter) on Base (8453) <-> GuardReactive, the clock, on Reactive mainnet (1597).
+# Live deploy: PositionGuard (+ GuardExt, GuardMeter, PoolMath) on Base (8453) <-> GuardReactive, the clock, on Reactive mainnet (1597).
 # Needs .env.live with LIVE_PRIVATE_KEY / LIVE_ADDRESS (a deploy-only wallet holding ETH on Base
 # and REACT on Reactive). Set BASE_RPC / REACT_RPC to local forks to rehearse.
 # Usage: script/live.sh deploy | status | stop | withdraw <amount-in-REACT>
 # If a deploy transaction lands but the script dies before saving its address, add the address to
-# the state file by hand (RX= / PM= / PG=) before running again, or a second copy gets deployed.
+# the state file by hand (RX= / PM= / MT= / EX= / PG=) before running again, or a second copy gets deployed.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ENV_FILE="${ENV_FILE:-.env.live}"
@@ -66,11 +66,22 @@ deploy)
     [ -n "$PM" ] || { echo "PoolMath deploy failed"; exit 1; }
     save PM "$PM"; echo "PoolMath (Base): $PM"; }
   check_pm "$PM"
+  LINK="src/lib/PoolMath.sol:PoolMath:$PM"
+  [ -z "${MT:-}" ] && {
+    MT=$(forge create src/GuardMeter.sol:GuardMeter --broadcast --rpc-url "$BASE_RPC"       --private-key "$LIVE_PRIVATE_KEY" --libraries "$LINK" --constructor-args $NPM $AERO $SUGAR | awk '/Deployed to/{print $3}')
+    [ -n "$MT" ] || { echo "GuardMeter deploy failed"; exit 1; }
+    save MT "$MT"; echo "GuardMeter (Base): $MT"; }
+  [ -z "${EX:-}" ] && {
+    EX=$(forge create src/GuardExt.sol:GuardExt --broadcast --rpc-url "$BASE_RPC"       --private-key "$LIVE_PRIVATE_KEY" --libraries "$LINK" --constructor-args $NPM $AERO $PROXY "$RX" $SUGAR "$MT" | awk '/Deployed to/{print $3}')
+    [ -n "$EX" ] || { echo "GuardExt deploy failed"; exit 1; }
+    save EX "$EX"; echo "GuardExt (Base): $EX"; }
   [ -z "${PG:-}" ] && {
-    PG=$(forge create src/PositionGuard.sol:PositionGuard --broadcast --rpc-url "$BASE_RPC" \
-      --private-key "$LIVE_PRIVATE_KEY" --libraries "src/lib/PoolMath.sol:PoolMath:$PM" --constructor-args $NPM $AERO $PROXY "$RX" $SUGAR | awk '/Deployed to/{print $3}')
+    PG=$(forge create src/PositionGuard.sol:PositionGuard --broadcast --rpc-url "$BASE_RPC"       --private-key "$LIVE_PRIVATE_KEY" --libraries "$LINK" --constructor-args $NPM $AERO $PROXY "$RX" $SUGAR "$MT" "$EX" | awk '/Deployed to/{print $3}')
     [ -n "$PG" ] || { echo "PositionGuard deploy failed"; exit 1; }
     save PG "$PG"; echo "PositionGuard (Base): $PG"; }
+  # the guard must run the extension and meter deployed above, nothing else
+  [ "$(read_ call "$PG" 'ext()(address)' --rpc-url "$BASE_RPC" | tr 'A-F' 'a-f')" = "$(echo "$EX" | tr 'A-F' 'a-f')" ] || { echo "guard.ext mismatch"; exit 1; }
+  [ "$(read_ call "$PG" 'meter()(address)' --rpc-url "$BASE_RPC" | tr 'A-F' 'a-f')" = "$(echo "$MT" | tr 'A-F' 'a-f')" ] || { echo "guard.meter mismatch"; exit 1; }
   [ "$(read_ call "$RX" 'guard()(address)' --rpc-url "$REACT_RPC" | tr 'A-F' 'a-f')" = "$(echo "$PG" | tr 'A-F' 'a-f')" ] && WIRED=1
   [ -z "${WIRED:-}" ] && {
     cast send "$RX" "setGuard(address)" "$PG" --rpc-url "$REACT_RPC" --private-key "$LIVE_PRIVATE_KEY" | ok

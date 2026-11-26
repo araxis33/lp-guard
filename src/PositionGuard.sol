@@ -319,7 +319,13 @@ contract PositionGuard is GuardCore {
     function setPricePool(uint256 tokenId, address via) external {
         Guarded storage g = _guarded[tokenId];
         if (g.owner != msg.sender) revert NotOwner();
-        if (via != address(0)) meter.aeroPrice(g.pool, via); // reverts unless it prices AERO for this pool
+        if (via != address(0)) {
+            meter.aeroPrice(g.pool, via); // reverts unless it prices AERO for this pool
+        } else if (_reenterOn[tokenId]) {
+            // parked coins go back in on AERO pay: a pair without AERO must keep its price (Codex 26.11)
+            (address t0, address t1) = _poolTokens(g.pool);
+            if (t0 != address(aero) && t1 != address(aero)) revert BadPricePool();
+        }
         _pricePool[tokenId] = via;
         emit PricePoolSet(tokenId, via);
     }

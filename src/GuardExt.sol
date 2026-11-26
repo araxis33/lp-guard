@@ -9,9 +9,15 @@ import {ICLPool, ICLGauge, IERC20, INonfungiblePositionManager} from "./interfac
 ///         `fallback` (delegatecall), on the guard's storage and balances; called directly it works on its
 ///         own empty storage and holds nothing.
 contract GuardExt is GuardCore {
+    /// @dev This contract's own address: a call straight to it (not through the guard) is refused, so
+    ///      nothing can be minted to an address that has no way to give it back (Codex 26.11).
+    address private immutable self;
+
     constructor(address npm_, address aero_, address callbackProxy_, address reactive_, address sugar_, address meter_)
         GuardCore(npm_, aero_, callbackProxy_, reactive_, sugar_, meter_)
-    {}
+    {
+        self = address(this);
+    }
 
     /// @notice One step in: take the tokens (either amount may be zero), pick the pool of the pair that
     ///         has earned the most net of price swings among `p.pool` and `p.alternates` (`p.pool` while
@@ -20,6 +26,7 @@ contract GuardExt is GuardCore {
     ///         become its alternates. Whatever the pool did not take goes straight back to the caller.
     /// @dev Any ETH sent along stays in the guard and pays for the Reactive callback.
     function open(OpenParams calldata p) external payable lock returns (uint256 tokenId) {
+        if (address(this) == self) revert NotGuarded();
         if (p.halfWidth == 0) revert BadWidth();
         if (p.maxLossBps >= 10_000) revert BadLimit();
         if (p.alternates.length > MAX_ALTERNATES) revert TooManyAlternates();
