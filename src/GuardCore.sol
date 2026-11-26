@@ -335,10 +335,14 @@ abstract contract GuardCore is AbstractCallback {
             uint256 x = safe == t1 ? IERC20(t0).balanceOf(address(this)) - a0 : IERC20(t1).balanceOf(address(this)) - a1;
             // capped, and only with room left after it to park or pay out, so a swap that runs
             // out of gas can never undo the close (Codex 26.11)
-            if (x > 0 && gasleft() > SWAP_GAS + 400_000) {
-                try ISwapOut(address(this)).swapOut{gas: SWAP_GAS}(g.pool, safe == t1, x) {}
-                catch {
+            if (x > 0) {
+                if (gasleft() <= SWAP_GAS + 400_000) {
                     emit ExitSwapFailed(tokenId);
+                } else {
+                    try ISwapOut(address(this)).swapOut{gas: SWAP_GAS}(g.pool, safe == t1, x) {}
+                    catch {
+                        emit ExitSwapFailed(tokenId);
+                    }
                 }
             }
         }

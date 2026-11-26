@@ -58,7 +58,7 @@ a{color:var(--blue)}
       <li>Reviewed once a day: AERO goes to your wallet, then the position is compared with just holding what you put in.</li>
       <li>Closed for you if it falls more than <b id="r-loss">3%</b> behind holding, or sits out of range for <b id="r-grace">3 hours</b>.</li>
       <li>Also closed when the pool stops paying: its AERO is worth less than what price swings cost by more than <b id="r-net">0.10%</b> a day (measured after 12 hours).</li>
-      <li>Every close pays out in USDC: the other coin is swapped in the same pool, at most 2% below the 30-minute average price, so a falling coin is not held after the exit. If that price cannot be had at that moment, you get both coins instead.</li>
+      <li>On every close the guard tries to turn everything into USDC, so a falling coin is not held after the exit: the other coin is swapped in the same pool, at most 2% below the 30-minute average price. If that swap cannot be done at that moment, you get both coins as they came out.</li>
       <li>When the guard closes it by itself, the coins wait on the guard for you and go back into the pool that pays once one earns over <b>0.10%</b> a day net of swings, at two daily reviews 20 hours apart.</li>
       <li>You can close it, take the position back as it is, or take parked coins back at any time. Nobody else can move them.</li>
     </ul>
