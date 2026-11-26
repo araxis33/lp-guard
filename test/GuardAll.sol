@@ -63,6 +63,7 @@ interface IGuard {
         );
     function parkedTotal(address) external view returns (uint256);
     function reenterOn(uint256) external view returns (bool);
+    function exitToken(uint256) external view returns (address);
     function reviewList(uint256) external view returns (uint256);
     function rangeWatch(uint256) external view returns (uint32 grace, uint64 outSince);
     function netExitBps(uint256) external view returns (uint16);

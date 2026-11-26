@@ -27,6 +27,11 @@ import {IPayable} from "@reactive/src/interfaces/IPayable.sol";
 ///         - the Reactive contract (through the callback proxy): close it, or run the daily review.
 ///           Everything from a close goes to the owner, so the worst it can do is close a position
 ///           early. It can never take funds. Nobody else can do anything.
+/// @dev The guard's own exit swap, called on itself so a failed swap can be skipped.
+interface ISwapOut {
+    function swapOut(address pool, bool zeroForOne, uint256 amountIn) external;
+}
+
 abstract contract GuardCore is AbstractCallback {
     using MulDiv for uint256;
 
@@ -88,8 +93,10 @@ abstract contract GuardCore is AbstractCallback {
     mapping(uint256 tokenId => RangeWatch) internal _rangeWatch;
     /// @notice Most positions one hourly check goes through, so it fits in one callback.
     uint256 public constant MAX_CHECK = 2;
-    /// @notice Gas each position may use in the hourly check (the fork test measures a close).
-    uint256 public constant GAS_PER_CHECK = 1_300_000;
+    /// @notice Gas each position may use in the hourly check. A close that also swaps into the exit
+    ///         token takes ~1.3-1.5M (fork, 26.11): 2M leaves the swap room. A plain check is ~0.2M, so two
+    ///         fit the Reactive CHECK_GAS of 3M; after a close the next position waits for the next hour.
+    uint256 public constant GAS_PER_CHECK = 2_000_000;
     uint256 internal checkCursor;
 
     /// @notice The hourly check saw the price leave a position's range (30-minute average tick).
@@ -141,6 +148,11 @@ abstract contract GuardCore is AbstractCallback {
     mapping(uint256 id => Park) internal _parked;
     /// @notice All parked coins of a token on the guard; its balance never drops below this.
     mapping(address token => uint256) internal _parkedTotal;
+    /// @dev Per position: the token everything is turned into when it is closed (for example USDC, so
+    ///      a falling coin is not held after the exit). Zero: both tokens as they come out.
+    mapping(uint256 id => address) internal _exitToken;
+    /// @notice The exit swap into the exit token failed (price being pushed): the two tokens were kept.
+    event ExitSwapFailed(uint256 indexed id);
 
     /// @notice The guard closed a position by itself and kept its coins for the owner.
     event Parked(uint256 indexed id, address indexed owner, uint256 amount0, uint256 amount1);
@@ -240,6 +252,7 @@ abstract contract GuardCore is AbstractCallback {
         address[] alternates; // other pools of the same pair: the guard opens in the one that earns most
         address pricePool; // pool of AERO and one of the pair's tokens; needed with alternates when AERO is not in the pair
         bool reenter; // keep coins after an automatic close and go back in when a pool pays again
+        address exitToken; // one of the pair's tokens everything is turned into on a close (e.g. USDC); 0 = both
     }
 
     /// @param callbackProxy_ Reactive's callback proxy on this chain.
@@ -266,19 +279,16 @@ abstract contract GuardCore is AbstractCallback {
 
     /// @dev A close the guard decides by itself: with re-entry on, the coins stay here as a parked plan
     ///      that keeps the position's settings (its pool joins the alternates); AERO still goes to the owner.
+    ///      Either way the coins are first turned into the position's exit token when it has one.
     function _exit(uint256 tokenId, Guarded memory g) internal {
-        if (!_reenterOn[tokenId]) return _close(tokenId, g, g.owner);
+        if (!_reenterOn[tokenId]) return _closeOut(tokenId, g);
+        address safe = _exitToken[tokenId];
         delete _guarded[tokenId];
         delete _moveVote[tokenId];
         delete moveVoteAt[tokenId];
         _rangeWatch[tokenId].outSince = 0;
         (,, address t0, address t1,, int24 lower, int24 upper,,,,,) = npm.positions(tokenId);
-        // credit what actually arrived, not what the position manager reports (Codex 26.11)
-        uint256 a0 = IERC20(t0).balanceOf(address(this));
-        uint256 a1 = IERC20(t1).balanceOf(address(this));
-        _empty(tokenId, g, g.owner, address(this));
-        a0 = IERC20(t0).balanceOf(address(this)) - a0;
-        a1 = IERC20(t1).balanceOf(address(this)) - a1;
+        (uint256 a0, uint256 a1) = _cashOut(tokenId, g, t0, t1, safe);
         alternates[tokenId].push(g.pool);
         _parked[tokenId] = Park({
             owner: g.owner,
@@ -294,6 +304,41 @@ abstract contract GuardCore is AbstractCallback {
         _parkedTotal[t0] += a0;
         _parkedTotal[t1] += a1;
         emit Parked(tokenId, g.owner, a0, a1);
+    }
+
+    /// @dev Closes and pays the owner, in the exit token when the position has one.
+    function _closeOut(uint256 tokenId, Guarded memory g) internal {
+        address safe = _exitToken[tokenId];
+        delete _guarded[tokenId];
+        (,, address t0, address t1,,,,,,,,) = npm.positions(tokenId);
+        _forget(tokenId);
+        (uint256 a0, uint256 a1) = _cashOut(tokenId, g, t0, t1, safe);
+        if (a0 > 0 && !IERC20(t0).transfer(g.owner, a0)) revert TransferFailed();
+        if (a1 > 0 && !IERC20(t1).transfer(g.owner, a1)) revert TransferFailed();
+    }
+
+    /// @dev Empties the position into the guard (AERO to the owner) and, when `safe` is one of its tokens,
+    ///      swaps the other one into it in the same pool (see PositionGuard.swapOut). A swap that fails is
+    ///      skipped, so a close never waits on it. Returns what this position now has on the guard.
+    function _cashOut(uint256 tokenId, Guarded memory g, address t0, address t1, address safe)
+        internal
+        returns (uint256 a0, uint256 a1)
+    {
+        a0 = IERC20(t0).balanceOf(address(this));
+        a1 = IERC20(t1).balanceOf(address(this));
+        _empty(tokenId, g, g.owner, address(this));
+        if (safe == t0 || safe == t1) {
+            uint256 x = safe == t1 ? IERC20(t0).balanceOf(address(this)) - a0 : IERC20(t1).balanceOf(address(this)) - a1;
+            if (x > 0) {
+                try ISwapOut(address(this)).swapOut(g.pool, safe == t1, x) {}
+                catch {
+                    emit ExitSwapFailed(tokenId);
+                }
+            }
+        }
+        // credit what actually arrived, not what the position manager reports (Codex 26.11)
+        a0 = IERC20(t0).balanceOf(address(this)) - a0;
+        a1 = IERC20(t1).balanceOf(address(this)) - a1;
     }
 
     /// @dev Unstakes (AERO to `aeroTo`), removes all liquidity and collects the tokens and fees to `to`.
@@ -329,6 +374,7 @@ abstract contract GuardCore is AbstractCallback {
         delete _moveVote[id];
         delete moveVoteAt[id];
         delete _reenterOn[id];
+        delete _exitToken[id];
         _unlist(id);
     }
 

@@ -62,7 +62,8 @@ contract MoveForkTest is Test {
                 maxLossBps: 300,
                 alternates: new address[](0),
                 pricePool: address(0),
-                reenter: false
+                reenter: false,
+                exitToken: address(0)
             })
         );
         address[] memory alts = new address[](1);

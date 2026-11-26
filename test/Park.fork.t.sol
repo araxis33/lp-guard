@@ -65,7 +65,8 @@ contract ParkForkTest is Test {
             maxLossBps: 0,
             alternates: alts,
             pricePool: AERO_USDC,
-            reenter: reenter
+            reenter: reenter,
+            exitToken: address(0)
         });
     }
 
@@ -82,8 +83,13 @@ contract ParkForkTest is Test {
     /// Sells WETH (token0) into CL50 until its price is far below a narrow range, then lets the
     /// hourly check run past the grace period: the guard closes the position by itself.
     function _closedByItself(uint256 id) internal {
+        _closedByItself(id, 3_000e18);
+    }
+
+    /// The same with a sale of `weth` (a realistic fall leaves USDC in the pool to swap into).
+    function _closedByItself(uint256 id, uint256 weth) internal {
         Seller s = new Seller();
-        deal(WETH, address(s), 3_000e18);
+        deal(WETH, address(s), weth);
         (, int24 before,,,,) = ICLPool(CL50).slot0();
         s.sell(CL50, WETH);
         (, int24 afterTick,,,,) = ICLPool(CL50).slot0();
@@ -91,7 +97,9 @@ contract ParkForkTest is Test {
         _skip(31 minutes);
         _check();
         _skip(3 hours);
+        uint256 g0 = gasleft();
         _check();
+        console2.log("gas for the hourly check that closes:", g0 - gasleft());
         (address owner,,,,,,) = guard.guarded(id);
         assertEq(owner, address(0), "closed by the hourly check");
     }
@@ -500,6 +508,98 @@ contract ParkForkTest is Test {
         vm.prank(user);
         vm.expectRevert(GuardCore.BadPricePool.selector);
         guard.setPricePool(id, address(0));
+    }
+
+    // ---- exit into USDC (his 26.11: "WETH may keep falling, USDC holds") ----
+
+    uint256 constant FALL = 1_200e18; // WETH sold into CL50: -536 ticks (~5.5%), USDC left in the pool
+
+    function _usdcExit(uint16 halfWidth, bool reenter) internal pure returns (GuardCore.OpenParams memory p) {
+        p = _params(0.1e18, 300e6, halfWidth, reenter);
+        p.exitToken = USDC;
+    }
+
+    function test_exitToken_parkedInUsdc_afterAFall() public {
+        uint256 id = _openAs(user, _usdcExit(1, true));
+        _closedByItself(id, FALL);
+        (address owner,,,, uint128 b0, uint128 b1,,,) = guard.parked(id);
+        assertEq(owner, user);
+        assertEq(b0, 0, "no WETH kept: it was swapped into USDC");
+        assertGt(b1, 0, "parked in USDC");
+        console2.log("parked USDC after the fall:", b1);
+        assertEq(guard.parkedTotal(WETH), 0);
+        assertEq(guard.parkedTotal(USDC), b1);
+        assertEq(IERC20(WETH).balanceOf(address(guard)), 0, "nothing in WETH on the guard");
+    }
+
+    function test_exitToken_reenterOff_ownerGetsUsdcOnly() public {
+        uint256 id = _openAs(user, _usdcExit(1, false));
+        uint256 w0 = IERC20(WETH).balanceOf(user);
+        uint256 u0 = IERC20(USDC).balanceOf(user);
+        _closedByItself(id, FALL);
+        assertEq(IERC20(WETH).balanceOf(user), w0, "no WETH to the owner");
+        assertGt(IERC20(USDC).balanceOf(user), u0, "USDC to the owner");
+        assertEq(IERC20(USDC).balanceOf(address(guard)), 0);
+        assertEq(IERC20(WETH).balanceOf(address(guard)), 0);
+    }
+
+    function test_exitToken_ownerClose_paysUsdc() public {
+        uint256 id = _openAs(user, _usdcExit(20, false));
+        uint256 w0 = IERC20(WETH).balanceOf(user);
+        uint256 u0 = IERC20(USDC).balanceOf(user);
+        vm.prank(user);
+        guard.close(id);
+        uint256 got = IERC20(USDC).balanceOf(user) - u0;
+        console2.log("in: 0.1 WETH + 300 USDC (refunds already back); out USDC:", got);
+        assertEq(IERC20(WETH).balanceOf(user), w0, "no WETH");
+        assertGt(got, 0);
+        assertEq(IERC20(USDC).balanceOf(address(guard)), 0);
+        assertEq(IERC20(WETH).balanceOf(address(guard)), 0);
+    }
+
+    function test_exitToken_swapFails_closeStillHappens_twoTokens() public {
+        uint256 id = _openAs(user, _usdcExit(20, false));
+        uint256 w0 = IERC20(WETH).balanceOf(user);
+        vm.mockCallRevert(CL50, abi.encodeWithSelector(ICLPool.swap.selector), bytes("pushed"));
+        vm.expectEmit(true, false, false, false, address(guard));
+        emit GuardCore.ExitSwapFailed(id);
+        vm.prank(user);
+        guard.close(id);
+        (address owner,,,,,,) = guard.guarded(id);
+        assertEq(owner, address(0), "closed anyway");
+        assertGt(IERC20(WETH).balanceOf(user), w0, "WETH as it came out");
+        assertEq(IERC20(WETH).balanceOf(address(guard)), 0);
+    }
+
+    function test_exitToken_reentersFromUsdcOnly() public {
+        uint256 id = _openAs(user, _usdcExit(1, true));
+        _closedByItself(id, FALL);
+        _cl100Pays();
+        _skip(1 days);
+        _reviewRun();
+        _skip(21 hours);
+        _reviewRun();
+        (address owner,,,,,,,,) = guard.parked(id);
+        assertEq(owner, address(0), "went back in from USDC alone");
+        uint256 newId = guard.reviewList(0);
+        (,, address pool,,,,) = guard.guarded(newId);
+        assertEq(pool, CL100);
+        assertEq(guard.exitToken(newId), USDC, "keeps exiting into USDC");
+        assertEq(IERC20(USDC).balanceOf(address(guard)), 0);
+        assertEq(IERC20(WETH).balanceOf(address(guard)), 0);
+    }
+
+    function test_exitToken_mustBeOneOfThePair() public {
+        GuardCore.OpenParams memory p = _usdcExit(20, false);
+        p.exitToken = AERO;
+        deal(WETH, user, 0.1e18);
+        deal(USDC, user, 300e6);
+        vm.startPrank(user);
+        IERC20A(WETH).approve(address(guard), type(uint256).max);
+        IERC20A(USDC).approve(address(guard), type(uint256).max);
+        vm.expectRevert(GuardCore.BadSwapPool.selector);
+        guard.open(p);
+        vm.stopPrank();
     }
 }
 

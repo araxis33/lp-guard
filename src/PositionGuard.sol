@@ -2,6 +2,7 @@
 pragma solidity ^0.8.29;
 
 import {GuardCore} from "./GuardCore.sol";
+import {MulDiv} from "./lib/MulDiv.sol";
 import {ICLPool, ICLGauge, IERC20, INonfungiblePositionManager} from "./interfaces/IAero.sol";
 
 /// @dev Functions of GuardExt the guard calls on itself (they reach GuardExt through `fallback`).
@@ -349,7 +350,38 @@ contract PositionGuard is GuardCore {
         Guarded memory g = _guarded[tokenId];
         if (g.owner == address(0)) revert NotGuarded();
         if (msg.sender != g.owner) revert NotOwner();
-        _close(tokenId, g, g.owner);
+        _closeOut(tokenId, g);
+    }
+
+    /// @dev Called by the guard on itself during a close: swaps `amountIn` in `pool` into the other token,
+    ///      valued at the 30-minute average: at most MAX_SPOT_DEVIATION past it and at least 98% of its value.
+    function swapOut(address pool, bool zeroForOne, uint256 amountIn) external {
+        if (msg.sender != address(this)) revert NotOwner();
+        address t0 = ICLPool(pool).token0();
+        address t1 = ICLPool(pool).token1();
+        int24 avg = _twapTick(pool);
+        uint160 sp = sugar.getSqrtRatioAtTick(avg);
+        if (zeroForOne) {
+            _swap(
+                pool,
+                true,
+                t0,
+                t1,
+                amountIn,
+                _in1(amountIn, sp) * 98 / 100,
+                sugar.getSqrtRatioAtTick(avg - MAX_SPOT_DEVIATION)
+            );
+        } else {
+            _swap(
+                pool,
+                false,
+                t1,
+                t0,
+                amountIn,
+                MulDiv.mulDiv(MulDiv.mulDiv(amountIn, Q96, sp), Q96, sp) * 98 / 100,
+                sugar.getSqrtRatioAtTick(avg + MAX_SPOT_DEVIATION)
+            );
+        }
     }
 
     /// @notice AERO the position has earned in the gauge and not yet claimed.
@@ -507,5 +539,9 @@ contract PositionGuard is GuardCore {
 
     function reenterOn(uint256 id) external view returns (bool) {
         return _reenterOn[id];
+    }
+
+    function exitToken(uint256 id) external view returns (address) {
+        return _exitToken[id];
     }
 }

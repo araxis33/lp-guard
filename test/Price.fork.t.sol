@@ -121,7 +121,8 @@ contract PriceForkTest is Test {
                 maxLossBps: 0,
                 alternates: new address[](0),
                 pricePool: address(0),
-                reenter: false
+                reenter: false,
+                exitToken: address(0)
             })
         );
         vm.stopPrank();

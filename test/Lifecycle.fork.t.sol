@@ -116,7 +116,8 @@ contract LifecycleForkTest is Test {
                 maxLossBps: 300,
                 alternates: new address[](0),
                 pricePool: address(0),
-                reenter: false
+                reenter: false,
+                exitToken: address(0)
             })
         );
         guard.setPricePool(id, VIA);

@@ -58,6 +58,8 @@ contract GuardExt is GuardCore {
             msg.sender, pool, half, t0, t1, b0, b1, p.amount0Min, p.amount1Min, p.stake, p.maxLossBps, p.graceSeconds
         );
         _settle(tokenId, all, pool, p.pricePool, p.reenter, 0);
+        if (p.exitToken != address(0) && p.exitToken != t0 && p.exitToken != t1) revert BadSwapPool();
+        _exitToken[tokenId] = p.exitToken;
         _sendNew(t0, msg.sender, b0);
         _sendNew(t1, msg.sender, b1);
     }
@@ -73,6 +75,7 @@ contract GuardExt is GuardCore {
         address via = _pricePool[id];
         uint16 netExit = _netExitBps[id];
         uint32 grace = _rangeWatch[id].grace;
+        address safe = _exitToken[id];
         _unpark(id, k);
         _forget(id);
         // everything on the guard except this plan's coins
@@ -80,6 +83,7 @@ contract GuardExt is GuardCore {
         uint256 b1 = IERC20(k.token1).balanceOf(address(this)) - k.bal1;
         uint256 newId = _enter(k.owner, pool, k.half, k.token0, k.token1, b0, b1, 0, 0, k.stake, k.maxLossBps, grace);
         _settle(newId, all, pool, via, true, netExit);
+        _exitToken[newId] = safe;
         _sendNew(k.token0, k.owner, b0);
         _sendNew(k.token1, k.owner, b1);
         emit Reentered(id, newId, pool);
@@ -100,6 +104,7 @@ contract GuardExt is GuardCore {
         uint32 grace = _rangeWatch[tokenId].grace;
         address via = _pricePool[tokenId];
         bool re = _reenterOn[tokenId];
+        address safe = _exitToken[tokenId];
         (address t0, address t1) = _poolTokens(target);
         // count only what this position returns, never coins that happen to sit on the guard
         uint256 b0 = IERC20(t0).balanceOf(address(this));
@@ -111,6 +116,7 @@ contract GuardExt is GuardCore {
         _netExitBps[newId] = netExit;
         _pricePool[newId] = via;
         _reenterOn[newId] = re;
+        _exitToken[newId] = safe;
         for (uint256 i = 0; i < alts.length; i++) {
             if (alts[i] == target) alts[i] = g.pool;
         }

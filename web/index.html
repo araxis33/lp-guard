@@ -58,6 +58,7 @@ a{color:var(--blue)}
       <li>Reviewed once a day: AERO goes to your wallet, then the position is compared with just holding what you put in.</li>
       <li>Closed for you if it falls more than <b id="r-loss">3%</b> behind holding, or sits out of range for <b id="r-grace">3 hours</b>.</li>
       <li>Also closed when the pool stops paying: its AERO is worth less than what price swings cost by more than <b id="r-net">0.10%</b> a day (measured after 12 hours).</li>
+      <li>Every close pays out in USDC: the other coin is swapped in the same pool (at most 2% below the 30-minute average price), so a falling coin is not held after the exit.</li>
       <li>When the guard closes it by itself, the coins wait on the guard for you and go back into the pool that pays once one earns over <b>0.10%</b> a day net of swings, at two daily reviews 20 hours apart.</li>
       <li>You can close it, take the position back as it is, or take parked coins back at any time. Nobody else can move them.</li>
     </ul>
@@ -116,7 +117,7 @@ a{color:var(--blue)}
     openWith: "0x8ea9db67", standing: "0xe73f3e5d", netPerDay: "0x39dad9b0", guarded: "0x5e284975", review: "0xe1e96c9b", close: "0x0aebeb4e",
     pendingAero: "0xee2beb63", reviewList: "0x3c01ec2b", reviewCount: "0xeff5924f", setPricePool: "0xb036f298", setNetExit: "0x4eac38d5", pricePool: "0x3a25d732", netExitBps: "0x62eff892",
     setAlternates: "0xfd68fff5", alternatesOf: "0x1e0b8430",
-    open: "0xffc069c9", parked: "0x994e7296", takeParked: "0xde9f4e70", setReenter: "0x82542bda", reenterOn: "0x59dc2451",
+    open: "0xb8bd9ee7", parked: "0x994e7296", takeParked: "0xde9f4e70", setReenter: "0x82542bda", reenterOn: "0x59dc2451",
     deposit: "0x7b6f6669", withdraw: "0x2e1a7d4d", getApproved: "0x081812fc", ownerOf: "0x6352211e", setMaxLoss: "0x17100711", tokenOfOwnerByIndex: "0x2f745c59",
   };
   const st = { account: null, busy: false };
@@ -236,9 +237,10 @@ a{color:var(--blue)}
     const via = hasAero ? ZERO : (AERO_PRICE_VIA[info.token1.toLowerCase()] || AERO_PRICE_VIA[info.token0.toLowerCase()]);
     status("st-open", "Step 2 of 3: put it in. The guard picks the pool of this pair that pays most, swaps half the USDC there and opens the position. Confirm in your wallet…");
     // open(OpenParams): a tuple with a dynamic member sits behind an offset; inside it the alternates
-    // list sits behind its own offset, counted from the tuple's start (12 head words)
+    // list sits behind its own offset, counted from the tuple's start (13 head words); the last head
+    // word is the exit token: everything comes out in USDC on a close
     const head = addr(pool) + word(usdc0 ? amount : 0n) + word(usdc0 ? 0n : amount) + word(HALF_WIDTH) + word(0) + word(0) +
-      word(1) + word(GRACE) + word(MAX_LOSS_BPS) + word(12 * 32) + addr(via) + word(1);
+      word(1) + word(GRACE) + word(MAX_LOSS_BPS) + word(13 * 32) + addr(via) + word(1) + addr(USDC);
     const tail = word(alts.length) + alts.map((x) => addr(x[0])).join("");
     const r = await send(SEL.open + word(32) + head + tail, CFG.guard, "deposit");
     const log = r.logs.find((l) => l.address.toLowerCase() === CFG.guard.toLowerCase() && l.topics[0] === DEPOSITED);
